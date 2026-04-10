@@ -1,0 +1,2052 @@
+# SGL Optimization Log
+
+Note: historical `fast`, `fast`, and `v2` labels below are obsolete. The only active quick gate is `fast`, backed by `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_fast_eval.jsonl`.
+
+## Environment Note
+
+- Local runner scripts / notes:
+  - `/Users/ql/cursor/openbmb`
+- Remote SGLang runtime under test:
+  - `rtx6000-2:/root/autodl-tmp/sglang`
+- Remote benchmark artifacts:
+  - `rtx6000-2:/root/autodl-tmp/SOAR-Toolkit/test_results`
+
+## Scope
+
+- Focus: SGLang-side runtime and kernel-path optimization for MiniCPM-SALA.
+- Goal: benchmark and compare multiple optimization ideas beyond the current NVFP4 calibration work.
+- Rule: each attempt should record the exact server args, code/path changes, benchmark command, and outcome.
+
+## Baseline Facts
+
+- Remote repo: `/root/autodl-tmp/sglang`
+- Current branch: `soar-pre-awq-backup-20260325`
+- Current working tree diff is minimal:
+  - `python/sglang/srt/utils/common.py` has a local warning-only version-check patch
+  - `python/sglang/srt/models/minicpm.py` already matches the previously noted SOAR custom branch state
+- Relevant history seen in `git log`:
+  - `backup MiniCPM SOAR patches before AWQ`
+  - `dense_as_sparse`
+  - multiple flashinfer / graph / sparse cache fixes
+
+## Bench Policy
+
+- `fast_test.sh` bench half is only a smoke signal and is not enough for serious speed decisions.
+- Prefer `bench_serving.sh` style measurements with a fixed local proxy speed dataset.
+- Keep local benchmark settings and datasets stable across attempts so relative comparisons remain meaningful.
+- Current local bench tiers:
+- `smoke`: 5 requests, very fast, useful for daily regression only
+- `proxy11`: 11 requests, built from the existing smoke+mini sets, intended to be more representative without becoming as harsh as the full mini tail
+- `mini`: 15 requests, stronger stress test, but currently harsher than the official public distribution and not cheap enough for every iteration
+
+## Attempt Log
+
+### Attempt 0: Audit Current Fusion State
+
+- Status: confirmed
+- What I checked:
+  - `git log` for `minicpm.py`, `minicpm_backend.py`, `layernorm.py`
+  - working-tree diff for likely fusion-related files
+- Current read:
+  - the main MiniCPM SOAR performance patches appear to already be baked into branch history, not pending in the worktree
+  - this suggests we should treat the current code as an already-fused baseline, then test deltas on top
+- Concrete diff vs `minicpm.py.orig`:
+  - removed the `q.float()/k.float()` RoPE round-trip and cast-back path
+  - switched decoder blocks to fused `residual + RMSNorm` usage
+  - final norm also consumes the carried residual path
+
+### Attempt 0.1: Curated Calibration Input For Quant Experiments
+
+- Status: confirmed
+- New calibration file:
+  - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_curated_v1.jsonl`
+- Mix:
+  - `96` SOAR public-style prompts
+  - `16` `cnn_dailymail`
+  - `16` `wikitext`
+- Task balance:
+  - `mcq=20`
+  - `qa=30`
+  - `niah=30`
+  - `fwe=8`
+  - `cwe=8`
+  - `open_text=32`
+- Length policy:
+  - token-aware slicing with `max_sample_tokens=8192`
+  - long samples use `head + middle + tail`
+  - tail region is intentionally weighted more heavily to preserve the actual question/instruction region
+
+## Planned Attempt Slots
+
+1. Baseline current server args and benchmark.
+2. Attention backend variant.
+3. Chunked prefill tuning.
+4. CUDA graph toggle validation.
+5. `dense-as-sparse` validation.
+6. Radix cache / cache-path validation.
+7. Additional fusion or kernel-path change if still uncovered.
+
+### Attempt 1: Base FP16 + `--fuse-topk` Smoke A/B
+
+- Status: blocked before launch
+- Why this was chosen:
+  - `sgl-optimization-candidates.md` ranks `--fuse-topk` as the first low-cost, high-signal runtime candidate
+  - it is a launch-arg-only delta with no code edits
+  - it can be tested on the base FP16 route to separate SGL runtime effects from NVFP4 calibration noise
+- Planned server delta vs current stable base serve:
+  - keep:
+    - `--model-path /root/autodl-tmp/models`
+    - `--dtype float16`
+    - `--attention-backend minicpm_flashinfer`
+    - `--chunked-prefill-size 8192`
+    - `--disable-radix-cache`
+    - `--disable-cuda-graph`
+    - `--dense-as-sparse`
+  - add:
+    - `--fuse-topk`
+- Planned benchmark command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --profile smoke
+```
+
+- Preflight blocker:
+  - remote reachability failed before GPU inspection
+  - `ssh rtx6000-2` returned:
+
+```text
+ssh: Could not resolve hostname connect.bjb1.seetacloud.com: -65563
+```
+
+  - because of that, I could not:
+    - inspect `/root/autodl-tmp/SOAR-Toolkit/test_results`
+    - verify `nvidia-smi` idleness
+    - check whether the earlier quantization tmux job had already exited
+- Outcome:
+  - no benchmark was launched
+  - no new speed or smoke-quality metrics were collected
+  - the single next experiment remains `--fuse-topk` on base FP16 once remote access works again
+
+### Attempt 1.1: Bench Harness Upgrade
+
+- Status: ready
+- What changed:
+  - `run_remote_candidate_bench.py` now starts the server with the explicit uv-environment `python3`
+  - this avoids the earlier failure mode where `bash -lc` resolved `python` to `/root/miniconda3/bin/python` instead of the shared uv runtime
+  - added `proxy` profile backed by a deterministic remote dataset:
+    - `/root/autodl-tmp/SOAR-Toolkit/bench_speed_v2_proxy11.jsonl`
+- Why `proxy11` exists:
+  - current `smoke` is only `5` rows
+  - current `mini` is `15` rows but contains an over-harsh tail, including prompts beyond the official `160K` public length cap
+  - with the current eligible local pool, `11` rows is a better fit than `12` because the official `128K-160K` bucket only has one valid candidate
+  - `proxy11` targets input-bucket counts of `3/1/2/4/1` for `0-4K / 4-16K / 16-32K / 32-128K / 128-160K`
+  - deterministic row selection:
+    - smoke rows `1,3,4,5`
+    - mini rows `1,3,4,6,8,11,14`
+
+### Attempt 1.2: Base FP16 `speed-smoke` Harness Check
+
+- Status: running, first hard result confirmed
+- Command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-speed-smoke-check \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile speed-smoke
+```
+
+- Confirmed facts:
+  - server now launches under the explicit uv python:
+    - `/root/autodl-tmp/sglang/sglang_minicpm_sala_env/bin/python3`
+  - `bench_serving.sh` no longer falls back to `/usr/bin/python3`
+  - `S1` is no longer `0`
+- First live result:
+  - `S1 benchmark duration = 189.13s`
+- Current read:
+  - bench is now genuinely usable for speed comparisons
+  - the remaining work is about tier design and runtime comparison quality, not basic harness breakage
+
+### Attempt 1.3: Remote Reachability Retest and SSH Retry Visibility
+
+- Status: no remote run launched
+- Why this step:
+  - before spending GPU time on `--fuse-topk`, I needed to re-check whether the remote host was actually reachable and idle
+  - earlier runs were blocked by resolver failures against `connect.bjb1.seetacloud.com`
+- What I observed:
+  - remote reachability is flapping
+  - one direct SSH probe succeeded and returned the expected host:
+
+```text
+connected
+autodl-container-u6thunte83-2b3090a0
+Thu Apr  9 02:49:30 CST 2026
+```
+
+  - immediately after that, the same host alias failed again with:
+
+```text
+ssh: Could not resolve hostname connect.bjb1.seetacloud.com: -65563
+```
+
+- Harness hardening:
+  - `run_remote_candidate_bench.py` already had transient SSH retries
+  - I expanded the retry matching to include macOS resolver text:
+    - `Name or service not known`
+    - `nodename nor servname provided`
+  - I also added retry logging so automation output now clearly distinguishes transient SSH/DNS failure from model or benchmark failure
+- Validation:
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - light probe through the runner's own `ssh()` helper produced:
+
+```text
+[bench] ssh retry 1/4 after transient failure: ssh: Could not resolve hostname connect.bjb1.seetacloud.com: nodename nor servname provided, or not known
+[bench] ssh retry 2/4 after transient failure: ssh: Could not resolve hostname connect.bjb1.seetacloud.com: nodename nor servname provided, or not known
+[bench] ssh retry 3/4 after transient failure: ssh: Could not resolve hostname connect.bjb1.seetacloud.com: nodename nor servname provided, or not known
+returncode=255
+```
+
+- Decision:
+  - do not launch `base-fp16-fuse-topk-smoke` yet
+  - the harness is ready, but remote idleness cannot be re-verified while DNS is unstable
+- Next step:
+  - as soon as SSH stabilizes, run the planned `base-fp16-fuse-topk-smoke` candidate unchanged
+
+### Attempt 1.3: Base FP16 `--fuse-topk` smoke preflight and SSH hardening
+
+- Status: benchmark launch blocked by intermittent local DNS failure
+- Chosen command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --profile smoke
+```
+
+- What was verified before launch:
+  - remote host was reachable once
+  - `nvidia-smi` reported the GPU idle at that moment:
+    - `NVIDIA RTX PRO 6000 Blackwell Server Edition, 0 MiB, 0 %`
+  - no active `sglang.launch_server`, `bench_serving`, `eval_model.py`, or `fast_test.sh` jobs were found
+- Harness fix applied before the retry:
+  - `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py` now wraps every SSH call with:
+    - `ConnectTimeout=10`
+    - up to `4` attempts
+    - retry only on clear transport-resolution failures such as `Could not resolve hostname`
+  - local syntax check passed:
+    - `python3 -m py_compile /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+- Actual blocker on retry:
+  - the local machine then lost DNS resolution for `connect.bjb1.seetacloud.com`
+  - repeated direct checks returned:
+
+```text
+ssh: Could not resolve hostname connect.bjb1.seetacloud.com: nodename nor servname provided, or not known
+```
+
+  - because the SSH transport never became stable again, the runner failed during `start_server()` before any remote server, eval, or bench logs were created
+- Result:
+  - no runtime metric was collected for `--fuse-topk`
+  - no second heavy GPU task was started
+  - the next runtime experiment remains the exact same `--fuse-topk` smoke command above
+- Next action:
+  - rerun the same command as soon as DNS resolution for `rtx6000-2` is healthy again
+
+### Attempt 1.4: Preflight-Only Path and Transport Classification
+
+- Status: ready and validated
+- Why this change:
+  - the runtime candidate itself is still the same `base-fp16-fuse-topk-smoke`
+  - the main blocker was transport ambiguity and the lack of a cheap first-step check before launching a heavy run
+- Harness hardening:
+  - `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py` now classifies SSH/transport failures into explicit categories such as:
+    - `dns_resolution`
+    - `connect_timeout`
+    - `connection_reset`
+    - `auth_or_hostkey`
+    - `transport_other`
+    - `remote_command_failure`
+  - the top-level runner now prints:
+    - `transport_classification=...`
+    - `transport_detail=...`
+  - the runner now performs a cheap remote preflight before any heavy run starts
+  - a dedicated `--preflight-only` mode now exists so the transport and remote-idle check can be run by itself
+- Preflight behavior:
+  - verifies SSH reachability
+  - checks remote hostname and timestamp
+  - checks GPU memory usage and utilization
+  - checks for active heavy jobs matching:
+    - `sglang.launch_server`
+    - `bench_serving`
+    - `eval_model.py`
+    - `fast_test.sh`
+  - marks the host idle only when:
+    - GPU memory used is `<= 256 MiB`
+    - GPU utilization is `<= 5%`
+    - no heavy jobs are active
+- Validation:
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - validated cheap preflight command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke-preflight \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --profile smoke \
+  --preflight-only
+```
+
+- Validation result:
+
+```text
+[bench] preflight transport=ok remote_idle=True host=autodl-container-u6thunte83-2b3090a0 time=2026-04-09_03:03:18 gpu_mem_mib=0 gpu_util_pct=0 active_jobs=0
+```
+
+- Exact next runtime command after preflight succeeds:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --profile smoke
+```
+
+### Attempt 1.5: `fuse_topk` backend guard and explicit batch-cap handoff
+
+- Status: runtime-side fix prepared locally
+- Concrete blocker from real run:
+  - the actual `base-fp16-fuse-topk-smoke` run reached model load and failed inside `minicpm_backend.py`
+  - with `fuse_topk=True`, the backend tried to JIT fused kernels with:
+
+```python
+for bs in range(1, model_runner.server_args.max_running_requests + 1):
+```
+
+  - but `model_runner.server_args.max_running_requests` was `None`, causing:
+
+```text
+TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+```
+
+- Why the backend should be fixed:
+  - `max_running_requests=None` is legal on the normal path in SGLang
+  - `server_args.py` only force-fills `48` for some speculative modes, not for the standard MiniCPM-SALA path
+  - so `minicpm_backend.py` must not assume the field is always populated
+- Runtime-side fix applied:
+  - both local SGLang draft copies of `minicpm_backend.py` now:
+    - read `max_running_requests` into `self.max_fused_batch_size`
+    - if `fuse_topk=True` but `max_running_requests is None`, print a warning and disable `fuse_topk` instead of crashing
+    - only JIT fused kernels when `self.fuse_topk` is still enabled
+  - the bench runner now accepts and forwards an explicit:
+    - `--max-running-requests`
+- Why both layers matter:
+  - backend fix prevents a hard crash and makes the runtime code safe
+  - explicit `--max-running-requests 48` is still needed when we actually want to benchmark the fused path rather than silently falling back to non-fused execution
+- Validation:
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/submission-drafts/nvfp4-mlp-only-draft/sglang/python/sglang/srt/layers/attention/minicpm_backend.py`
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/attention/minicpm_backend.py`
+- Exact rerun command after fix:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --max-running-requests 48 \
+  --profile smoke
+```
+
+### Attempt 1.6: Second `fuse_topk` blocker and runtime decision
+
+- Status: do not demote yet; patch the local callsite drift and give `fuse_topk` one final bounded retry
+- New blocker from real run:
+  - after passing `--max-running-requests 48`, the server got deeper into MiniCPM sparse backend init and failed in the TileLang JIT path with:
+
+```text
+TypeError: fused_attn_pooling_online_topk_prefill() missing 2 required positional arguments: 'actual_max_seqlen_q' and 'actual_max_seqlen_k'
+```
+
+- Analysis:
+  - this is a local callsite/signature mismatch, not evidence that the optimization idea itself is invalid
+  - in the local `minicpm_fuse_kernel.py`, `actual_max_seqlen_q` and `actual_max_seqlen_k` appear only in the function signature and docstring
+  - they are not referenced in the current kernel body
+  - that makes this a bounded local bug worth patching once
+- Runtime decision:
+  - keep `fuse_topk` as the immediate next runtime candidate for one more retry
+  - if the next run fails again inside deeper TileLang/JIT logic, stop spending time on it and demote `fuse_topk`
+  - at that point, move to `split_stage1` as the next clean launch-arg candidate
+- Local fix state:
+  - both local SGLang draft copies of `minicpm_backend.py` now pass the required signature arguments for `fused_attn_pooling_online_topk_prefill`
+  - the values wired in are:
+    - `actual_max_seqlen_q=model_runner.server_args.chunked_prefill_size`
+    - `actual_max_seqlen_k=max_cache_len`
+  - added a clarifying comment that these are currently signature-only in the local TileLang fork
+- Exact next runtime experiment after this decision:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke-mrr48 \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --max-running-requests 48 \
+  --profile smoke
+```
+
+- Fallback if this still fails:
+  - immediately demote `fuse_topk`
+  - next runtime candidate becomes:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-split-stage1-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --split-stage1 \
+  --profile smoke
+```
+
+### Attempt 1.6: `fuse_topk` prefill JIT call-path patch
+
+- Decision:
+  - choose `1) patch the fused call path if the fix is local and bounded`
+  - do not demote `fuse_topk` yet
+- Why this is still patchable:
+  - the second blocker is not a transport issue and not a broad kernel-correctness failure yet
+  - it is a local call-site/signature mismatch:
+    - `fused_attn_pooling_online_topk_prefill(...)` now requires:
+      - `actual_max_seqlen_q`
+      - `actual_max_seqlen_k`
+    - `minicpm_backend.py` was still calling it without those arguments
+  - from the current local code, those two static parameters are declared in `minicpm_fuse_kernel.py` but are not yet referenced inside the kernel body
+  - that makes this a bounded compatibility patch rather than an open-ended algorithm rewrite
+- Runtime-side fix applied:
+  - in both local draft copies of `minicpm_backend.py`, the fused prefill JIT call now passes:
+    - `actual_max_seqlen_q=model_runner.server_args.chunked_prefill_size`
+    - `actual_max_seqlen_k=max_cache_len`
+  - these are the most sensible static upper-bound values available at init time for the current prebuild path
+- Validation:
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/submission-drafts/nvfp4-mlp-only-draft/sglang/python/sglang/srt/layers/attention/minicpm_backend.py`
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/attention/minicpm_backend.py`
+- Exact next runtime command after syncing this runtime patch into the active remote SGLang code:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke-mrr48 \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --max-running-requests 48 \
+  --profile smoke
+```
+
+- Demotion threshold:
+  - if the next real run gets past this signature mismatch and immediately hits a deeper TileLang/kernel correctness issue, `fuse_topk` should then be demoted behind `--split-stage1`
+
+### Attempt 1.7: Post-smoke runtime handoff decision
+
+- Current condition:
+  - a separate heavy GPU job is still running, so runtime work stays in prep mode only
+- Decision:
+  - do **not** demote `fuse_topk` yet
+  - there is still exactly one bounded local patch worth consuming first:
+    - the prefill JIT call-path compatibility patch already prepared in local `minicpm_backend.py`
+- Why this is still the right order:
+  - the latest blocker is still a local call-site mismatch, not yet evidence that the fused kernels themselves are fundamentally broken on this runtime
+  - the added arguments are required by the current TileLang JIT entrypoint and were simply omitted by the caller
+  - from the local kernel source, those two new static parameters are declared but not yet used in the kernel body, so the patch is low-risk and bounded
+- Exact next runtime candidate after the current smoke finishes:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke-mrr48 \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --max-running-requests 48 \
+  --profile smoke
+```
+
+- Required local prep before that run:
+  - no additional new code changes are needed beyond the already-prepared `minicpm_backend.py` patch
+  - the same patch must be present in the active SGLang runtime copy used by the remote benchmark before launching the command above
+- Immediate fallback if this still fails:
+  - demote `fuse_topk` behind `--split-stage1`
+  - then the next runtime candidate becomes:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-split-stage1-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --split-stage1 \
+  --profile smoke
+```
+
+## 2026-04-09 Attempt 1.4 base FP16 fuse_topk smoke
+
+- Closed-loop step reached:
+  - worker delivery collected
+  - one real experiment launched
+  - blocker fed back to workers for resumed follow-up
+- Exact command run:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --profile smoke
+```
+
+- Run directory:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_030449_base-fp16-fuse-topk-smoke`
+- Outcome:
+  - remote transport was healthy enough to launch
+  - model weights loaded successfully
+  - failure was in the runtime code path before `fast_eval` or `bench_smoke` produced results
+- Concrete blocker from `server.log`:
+
+```text
+TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+```
+
+- Root cause:
+  - with `--fuse-topk`, `MiniCPMSparseBackend` in `minicpm_backend.py` assumes `model_runner.server_args.max_running_requests` is an integer
+  - current server args leave it as `None`
+  - the code does `range(1, max_running_requests + 1)` and crashes during backend initialization
+- Immediate next action:
+  - patch the runtime side to handle `max_running_requests=None` safely, and consider whether the runner should also set an explicit fallback value for `--max-running-requests`
+
+## 2026-04-09 Attempt 1.5 base FP16 fuse_topk smoke with explicit max_running_requests
+
+- Exact command run:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke-mrr48 \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --max-running-requests 48 \
+  --profile smoke
+```
+
+- Run directory:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_030942_base-fp16-fuse-topk-smoke-mrr48`
+- Outcome:
+  - remote transport was healthy
+  - service got past the `max_running_requests=None` failure
+  - model weights loaded successfully
+  - fused JIT path still failed before `fast_eval` or `bench_smoke` produced results
+- Concrete blocker from `server.log`:
+
+```text
+TypeError: fused_attn_pooling_online_topk_prefill() missing 2 required positional arguments: 'actual_max_seqlen_q' and 'actual_max_seqlen_k'
+```
+
+- Current read:
+  - this is no longer a launch-arg issue
+  - `fuse_topk` now looks blocked by a deeper TileLang/callsite mismatch in the local fused kernel path
+  - this likely needs either a code fix in the `fuse_topk` callsite or deprioritization of `fuse_topk` in favor of the next runtime candidate
+
+### Attempt 1.8: explicit post-bench runtime ordering
+
+- Current condition:
+  - another heavy GPU bench is still active, so this pass stays in lightweight prep mode only
+- Final decision for ordering:
+  - keep `fuse_topk` ahead of `split-stage1` for exactly one more rerun
+  - this is justified only because the remaining blocker is still a bounded local compatibility patch, not yet a demonstrated fused-kernel correctness failure
+  - if the next `fuse_topk` rerun fails again anywhere in TileLang/kernel init, demote it immediately behind `--split-stage1`
+- Exact next runtime candidate after the current bench finishes:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-fuse-topk-smoke-mrr48 \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --fuse-topk \
+  --max-running-requests 48 \
+  --profile smoke
+```
+
+- Local prep required before that rerun:
+  - no new code edits beyond the already-prepared `minicpm_backend.py` call-path patch
+  - the active remote SGLang runtime copy must include that same patch before launch
+- Concrete fallback if that rerun fails:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-split-stage1-smoke \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --split-stage1 \
+  --profile smoke
+```
+
+### Attempt 1.9: stock-base control audit and harness gate
+
+- Goal:
+  - prepare the right next step once the near-stock base control smoke/proxy result lands
+  - avoid misclassifying a bad tiny-smoke result as a runtime regression
+- Current audit of local bench tiers:
+  - `smoke`
+    - useful for service reachability, empty-output detection, obvious stop-behavior collapse, and large regressions
+    - not representative enough for quality conclusions
+    - it takes only one shortest sample per task, so it is highly sensitive to sample-specific formatting quirks
+  - `proxy11`
+    - useful for relative speed comparison
+    - closer to the official input-length distribution than `smoke`
+    - still not a quality benchmark; it should not be used to explain a low score
+  - `speed-smoke`
+    - useful only to verify that speed measurement is alive and nonzero
+    - not representative enough to choose a final runtime path by itself
+- Harness symptoms to watch if stock-base smoke is also weak:
+  - failures concentrated in `mcq` while the outputs are non-empty and look semantically correct
+  - many short samples ending with `finish_reason=length`
+  - stock-base and experimental routes both failing the same tiny smoke subset
+  - healthy speed path and server stability, but poor tiny-smoke quality
+- Why those are harness-shaped signals:
+  - `fast_test.sh` uses a very small sample set and a narrow MCQ extractor
+  - current MCQ extraction heavily prefers:
+    - `ANSWER: A`
+    - boxed forms like `\boxed{A}`
+  - a semantically correct but differently formatted stock output can therefore look like a fail
+- Most valuable next action if stock-base smoke is weak or ambiguous:
+  - do not jump straight into another runtime A/B
+  - first run a stock-base `mini_test.sh` quality cross-check on the same stable serve path
+- Exact command prepared for that case:
+
+```bash
+ssh rtx6000-2 'source /root/autodl-tmp/use_soar_uv.sh >/dev/null 2>&1 && pkill -f "sglang.launch_server --host 127.0.0.1 --port 30001" >/dev/null 2>&1 || true && nohup /root/autodl-tmp/sglang/sglang_minicpm_sala_env/bin/python3 -m sglang.launch_server --model-path /root/autodl-tmp/models --trust-remote-code --host 127.0.0.1 --port 30001 --dtype float16 --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --skip-server-warmup --disable-radix-cache --disable-cuda-graph --dense-as-sparse > /root/autodl-tmp/SOAR-Toolkit/test_results/stock_base_control_server.log 2>&1 & sleep 20 && cd /root/autodl-tmp/SOAR-Toolkit && API_BASE=http://127.0.0.1:30001 TIMEOUT=0 MINI_PER_TASK=4 EVAL_MAX_TOKENS=0 EVAL_MIN_TOKENS=512 bash mini_test.sh | tee /root/autodl-tmp/SOAR-Toolkit/test_results/stock_base_control_mini.log'
+```
+
+- Why this is the best post-control step:
+  - it resolves whether low stock smoke is a harness/sample artifact or a real runtime problem
+  - it is still cheaper than a full 150-question public eval
+  - it gives a better quality read than `smoke` without mixing in a new runtime variable
+
+## 2026-04-09 Stock-Base Control Smoke Result
+
+- Control setup:
+  - remote editable `sglang` was switched to `/root/autodl-tmp/sglang-stock/python`
+  - that stock tree was created from `git archive HEAD` and then had `minicpm.py.orig` restored
+- Fast smoke result from:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_033456_stock-base-fp16-smoke-control/fast_eval.log`
+
+```text
+avg_score=28.00%
+pass=1
+part=1
+fail=3
+```
+
+- Per-task signals:
+  - `cwe=0.40`
+  - `fwe=1.00`
+  - `mcq=0.00`
+  - `niah=0.00`
+  - `qa=0.00`
+- Runtime-side interpretation:
+  - this matches the earlier working-tree `base-fp16` smoke headline score exactly
+  - therefore the weak smoke result is not explained by our current fused `minicpm.py` delta alone
+  - smoke remains too small and too format-sensitive to use as the only quality gate
+  - since both stock and working-tree smoke are similarly weak, the next runtime move should not be another model-file rollback experiment
+- Runtime ordering update:
+  - if the ongoing stock speed smoke does not expose a transport/runtime failure, the next quality-control experiment should be the queued stock-base `mini_test.sh` command already recorded above
+  - only after that control-quality read should we resume runtime A/Bs like `fuse_topk` or `split-stage1`
+
+## 2026-04-09 Official Eval Gate After Stock Control
+
+- Official quality script confirmed in toolkit:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_model.py`
+- Relevant official-eval properties:
+  - dataset-driven, not 5-sample smoke-driven
+  - `/v1/chat/completions`
+  - `concurrency=8`
+  - `max_out_len=65536`
+  - `mode='mid'`
+  - `--num_samples` optional; unset means full dataset
+- Runtime conclusion:
+  - with stock-base `fast_test.sh` also landing at `28.00%`, `fast_test.sh` must be treated as a smoke gate only
+  - for route ranking, `eval_model.py` is the quality source of truth, not another `smoke` rerun
+
+## 2026-04-09 stock-base official eval in flight
+
+- Current state:
+  - the official stock-base eval is already running in tmux window:
+    - `stock-official-eval`
+  - log directory:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318`
+- Runtime policy while it runs:
+  - do not start any other heavy GPU task
+  - treat this run as the current quality truth source for calibrating local harnesses
+
+## 2026-04-09 local harness fix after stock-base control
+
+- Most important lightweight local change:
+  - add a `mini-eval` quality mode to `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - this allows local quality cross-checking with `mini_test.sh` through the same preflight/serve/teardown path
+  - it avoids overloading `fast_test.sh --eval-only` as if it were a quality benchmark
+- Why this is the right fix:
+  - it is local-only and does not interfere with the current long-running official eval
+  - it upgrades the local harness from:
+    - `smoke only`
+  - to:
+    - `smoke for quick health`
+    - `mini-eval` for lightweight quality cross-check
+    - `official` for actual quality truth
+- Validation:
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+
+## 2026-04-09 post-official lightweight cross-check
+
+- Best next lightweight cross-validation after the official stock-base eval finishes:
+  - run stock-base through the new `mini-eval` mode
+  - compare the local `mini-eval` score and failure pattern with the official stock-base result
+  - use that to judge whether local `mini-eval` is predictive enough for future runtime A/B triage
+- Exact command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label stock-base-fp16-mini-eval \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+## 2026-04-09 Official Stock Eval Running
+
+- Official stock-base eval is now in flight in remote `tmux`:
+  - session/window: `codex-soar:stock-official-eval`
+- Run directory:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318`
+- Runtime implication while this run is active:
+  - no new runtime A/B should be launched
+  - the next runtime decision should be made only after the official stock-base quality signal lands
+  - if the official stock-base eval still looks weak, prioritize a control-quality cross-check such as stock-base `mini_test.sh` before resuming `fuse_topk` or `split-stage1`
+
+## 2026-04-09 Official Eval Running State
+
+- Active long-running quality source of truth:
+  - remote tmux window: `codex-soar:stock-official-eval`
+  - run dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318`
+- Confirmed launch state:
+  - stock-base server is up on `127.0.0.1:30001`
+  - `eval_model.py` is running on the full `150`-sample public dataset
+  - `concurrency=8`
+  - current policy is `no second heavy GPU job until this run ends`
+- Runtime implication while it is running:
+  - do not start `mini_test.sh`
+  - do not resume `fuse_topk` / `split-stage1`
+  - keep runtime work limited to log review and post-run preparation only
+- First lightweight runtime preflight immediately after official eval completes:
+
+```bash
+ssh rtx6000-2 'RUN_DIR=$(cat /root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_latest.txt) && echo RUN_DIR=$RUN_DIR && rg -n "Average Score|Total Duration|Overall TPS|Request failed|ERROR|HTTP" "$RUN_DIR/eval_model.log" "$RUN_DIR/server.log" || true && tail -n 20 "$RUN_DIR/eval_model.log"'
+```
+
+- Why this is the right next lightweight check:
+  - it tells us whether the full official eval actually completed cleanly
+  - it extracts the official quality number before we spend another GPU minute
+  - it cleanly gates the next branch:
+    - if official stock quality is materially healthier than smoke, keep `fast_test.sh` in the smoke-only bucket and move on to route comparison
+    - if official stock quality is still weak, prefer another quality-control step before runtime A/B
+
+## 2026-04-09 Runtime Hold While Official Stock Eval Runs
+
+- Active official-quality run:
+  - `tmux` window:
+    - `codex-soar:stock-official-eval`
+  - run directory:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318`
+- Live-status preflight during this pass:
+  - `server ready`
+  - `eval_model.py` started with:
+    - `150` samples
+    - `concurrency=8`
+  - visible progress at check time:
+    - `8/150`
+- Runtime policy during this run:
+  - do not start `mini_test.sh`
+  - do not resume `fuse_topk` / `split-stage1`
+  - keep runtime work limited to log review and post-run preparation only
+- Immediate post-run gate remains:
+  - first inspect the official-eval logs with the lightweight grep/tail preflight already recorded above
+  - only after that decide between:
+    - stock-base `mini_test.sh`
+    - runtime A/B resumption
+
+## 2026-04-09 Post-Official-Eval Runtime Gate
+
+- Decision split after the official stock eval finishes:
+  - if the official stock eval is technically healthy:
+    - clean completion
+    - `Average Score` and `Total Duration` are present
+    - no obvious `Request failed`, `HTTP`, or server-side error patterns dominate the log
+  - if the official stock eval is not technically healthy:
+    - missing summary lines
+    - request/pathology errors
+    - or another obviously invalid completion state
+
+- If technically healthy, first light verification before resuming route comparison:
+  - establish one cheap control proxy on the same stable stock-base serve path using our local mini harness
+  - exact command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label stock-base-fp16-mini-control \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+  - why this branch exists:
+    - it gives us a cheaper, repeatable control signal after the official baseline is known-good
+    - only after this mini-control lands should route comparison resumes for candidates like `gptq_marlin` or runtime A/B
+
+- If not technically healthy, next quality-control check before any runtime A/B:
+  - rerun an official-style stock-base check on a small subsample with reduced concurrency to isolate whether the problem is the full official path itself
+  - exact command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label stock-base-fp16-official-subsample-c1 \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile official \
+  --official-data-path eval_dataset/perf_public_set.jsonl \
+  --official-max-seq-len 524288 \
+  --official-concurrency 1 \
+  --official-num-samples 12
+```
+
+  - why this branch exists:
+    - it keeps the quality-control path close to the official script
+    - it separates “official eval path itself is unhealthy” from “model baseline is genuinely weak”
+    - no runtime A/B should resume until this subsample official check is understood
+
+## 2026-04-09 full-eval queue policy for quantization-first phase
+
+- Main-line change:
+  - runtime speed work is no longer the priority
+  - the main line is now:
+    - quantization-route review
+    - official full-quality evals for quantization candidates
+  - the current stock-base official eval keeps running and must not be interrupted
+
+- Why one SGL server should not carry two formal full official evals at the same time:
+  - `eval_model.py` already drives the server with multiple concurrent requests
+  - mixing two formal eval clients on one server destroys attribution:
+    - latency no longer belongs to one eval run
+    - failures and retries become ambiguous
+    - server-side logs cannot be cleanly mapped back to one candidate
+  - the request streams interfere at the scheduler and KV-cache level, so the observed duration is no longer a valid official-comparison signal
+  - if one run hits a pathological sample, it can back up the shared server and distort the other run's timing and completion behavior
+
+- Why a serialized queue is the safer choice under current memory conditions:
+  - the current official eval already occupies one long-lived server process plus concurrent generation workload
+  - forcing a second full eval means either:
+    - reusing the same loaded server and mixing request streams, which invalidates the measurement
+    - or launching a second server/model process, which is the riskier option for memory pressure and instability
+  - with long-context MiniCPM-SALA, instability usually shows up as:
+    - OOM or allocator pressure
+    - degraded throughput from cache contention
+    - confusing timeout / retry / partial-output behavior
+  - a serialized queue gives cleaner logs, more stable memory behavior, and a trustworthy mapping from one candidate to one official result
+
+- Smallest local cross-check after an official eval finishes:
+  - do one lightweight local `mini-eval` on the exact same stable serve path for that candidate
+  - do not start another full official eval before that small cross-check is inspected
+  - exact command template:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label candidate-post-official-mini-eval \
+  --model-path /root/autodl-tmp/models \
+  --dtype float16 \
+  --quantization none \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+- Purpose of that cross-check:
+  - confirm the local harness still tracks the official result directionally
+  - catch gross post-eval serve/path regressions without paying for another full run
+  - keep the queue moving while preserving one clean official result per candidate
+
+## 2026-04-09 Runtime Gate Kept Current
+
+- Heavy GPU work remains paused while the official stock eval is still running.
+- The exact post-run branch commands above are the current source of truth:
+  - healthy official eval:
+    - run `stock-base-fp16-mini-control`
+  - technically unhealthy or weak official eval:
+    - run `stock-base-fp16-official-subsample-c1`
+- No runtime A/B should be scheduled before one of those two branch commands is chosen from the post-run grep/tail preflight.
+
+## 2026-04-09 Post-Official Minimal Cross-Check Rules
+
+- Treat the just-finished official full eval as the quality truth; do not use `fast_test.sh --eval-only` to overrule it.
+- Before starting the next official full eval, run exactly one local `mini-eval` on the same stable serve path for the same candidate.
+- Compare only direction and obvious pathologies: score order, empty outputs, repeated `finish_reason=length`, and major task collapse.
+- If local `mini-eval` disagrees sharply with the official result, debug the local harness first; do not schedule another runtime A/B from `smoke`.
+
+## 2026-04-09 Minimal Local `mini-eval` Template
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label <LABEL> \
+  --model-path <MODEL_PATH> \
+  --quantization <none|modelopt|gptq> \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+## 2026-04-09 Direct `mini-eval` Commands For Post-Official Cross-Checks
+
+`gptq_marlin`
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label gptq-marlin-mini-eval \
+  --model-path /root/autodl-tmp/models-gptq-w4a16-v19 \
+  --quantization gptq \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+`nvfp4 curated16k128`
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label nvfp4-curated16k128-mini-eval \
+  --model-path /root/autodl-tmp/models-nvfp4-mlp-only-curated16k-128 \
+  --quantization modelopt \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+## 2026-04-09 Serve-Flag Accuracy Audit And Minimal Precision Control
+
+- Current stable serve path used for official/mini style checks:
+  - `--dtype float16`
+  - `--attention-backend minicpm_flashinfer`
+  - `--chunked-prefill-size 8192`
+  - `--disable-radix-cache`
+  - `--disable-cuda-graph`
+  - `--dense-as-sparse`
+  - plus route-specific quantization:
+    - base: `--quantization none`
+    - NVFP4: `--quantization modelopt`
+    - GPTQ/Marlin: `--quantization gptq`
+
+- Flags most likely to affect correctness, not just speed:
+  - `--quantization`
+    - primary source of accuracy change
+  - `--dtype`
+    - correctness-relevant for MiniCPM-SALA; earlier base runs showed non-fp16 loading/runtime issues
+  - `--attention-backend`
+    - backend-specific numerical/runtime path; keep fixed across control and candidate
+  - `--chunked-prefill-size`
+    - should mostly be a runtime knob, but can surface long-context/path bugs if the prefill path is unstable
+  - `--dense-as-sparse`
+    - not a pure speed flag here; it changes which execution path handles requests, so keep it fixed during precision control
+
+- Flags currently treated as lower correctness risk on the stable path:
+  - `--disable-cuda-graph`
+    - mainly speed/stability
+  - `--disable-radix-cache`
+    - mainly speed/cache behavior
+
+- Minimal precision-control experiment after the official queue:
+  - run a paired local `mini-eval` A/B with identical stable serve flags
+  - change only:
+    - `--model-path`
+    - `--quantization`
+  - interpretation:
+    - if stock/base is healthy but the quantized route drops, blame quantization first
+    - if both are similarly depressed, inspect serve path or local harness before blaming quantization
+
+- Exact command pair template:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-mini-eval-control \
+  --model-path /root/autodl-tmp/models \
+  --quantization none \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label <CANDIDATE_LABEL>-mini-eval-control \
+  --model-path <CANDIDATE_MODEL_PATH> \
+  --quantization <none|modelopt|gptq> \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+- Rule for this control:
+  - do not change `attention-backend`, `chunked-prefill-size`, `dense-as-sparse`, or `dtype` inside the control pair
+  - otherwise the experiment no longer isolates quantization from serve-path effects
+
+## 2026-04-09 Quant-First Runtime Support State
+
+- Runtime/support role in this pass:
+  - speed optimization remains paused
+  - official full eval remains the quality source-of-truth
+  - local validation remains subordinate to the official path
+- Why we are still not sharing one server across two formal full evals:
+  - the active official eval already drives the server concurrently
+  - a second formal client would blur attribution for latency, failures, and output pathologies
+  - for different quantized candidates, the loaded model itself differs, so one shared formal server is not a valid comparison setup
+- Current runtime-support expectation after the stock-base official eval:
+  - do exactly one same-route local `mini-eval`
+  - use it only as a directional cross-check
+  - if it disagrees sharply with the official result, repair the local harness before any new official comparison
+
+## 2026-04-09 Mid-Run Runtime Refresh
+
+- Official stock-base eval is still the only heavy run.
+- This pass kept runtime heavy work paused and used only a cheap health preflight.
+- Fresh runtime delivery in this pass:
+  - `stock-base-fp16-mini-control` remains the healthy-branch local cross-check
+  - bounded fallback remains an `official` subsample run with `--official-num-samples 12`
+  - runner help was checked and confirmed to support:
+    - `--profile official`
+    - `--official-data-path`
+    - `--official-max-seq-len`
+    - `--official-concurrency`
+    - `--official-num-samples`
+- New small blocker captured:
+  - remote host lacks `rg`
+  - runtime post-run scans must use `grep -E`
+- Follow-up assigned in this pass:
+  - runtime worker must provide one unified `grep -E` post-run summary command for official-eval completion
+
+## 2026-04-09 Remote DNS Blocker
+
+- Fresh runtime delivery in this pass:
+  - the next runtime-side step is still the same-route post-official `mini-eval`
+  - it is not runnable until remote reachability from this machine recovers
+- Cheap preflight result from this pass:
+  - `ssh -G rtx6000-2` is correct
+  - local DNS lookup for `connect.bjb1.seetacloud.com` currently fails with:
+    - `gaierror(8, 'nodename nor servname provided, or not known')`
+- Runtime follow-up after this result:
+  - keep the post-official same-route `mini-eval` paused
+  - do not schedule a new runtime-side run from this machine until DNS resolution is restored
+- Worker bookkeeping for this pass:
+  - runtime worker delivered:
+    - yes
+  - runtime worker received a concrete follow-up:
+    - yes
+
+## 2026-04-09 Runtime Hold: Official Eval Still Running At 50/150
+
+- Fresh runtime delivery in this pass:
+  - while the stock-base official eval is still running, runtime should only do a `tmux capture-pane` style status check
+  - after the official eval finishes, runtime should immediately run the shared `grep -E` plus tail summary scan
+- Current official-eval state seen by the orchestrator:
+  - `50/150`
+  - continued `200 OK`
+  - no newly observed `ERROR`
+  - no newly observed `Request failed`
+- Follow-up assigned in this pass:
+  - keep the post-official runtime gate current in:
+    - `/Users/ql/cursor/openbmb/sgl-optimization-log.md`
+
+## 2026-04-09 Runtime Comparison Versus Original Weights
+
+- Fresh runtime delivery in this pass:
+  - original weights and working-tree base both land at:
+    - `28.00%` on the current local smoke gate
+  - this means the low local smoke score is not enough evidence that our modified runtime path broke quality
+- Current interpretation:
+  - the next decisive metric must be the official `Average Score`
+  - until that lands, runtime should keep guarding against over-reading `smoke`
+- Follow-up assigned in this pass:
+  - keep the post-official runtime guardrail fixed on:
+    - healthy official result -> stock-base mini-control first
+    - unhealthy or contradictory official/local picture -> repair local harness before route comparison
+
+## 2026-04-09 Runtime Branches Ready, Still Waiting On Official Stock Result
+
+- Fresh runtime delivery in this pass:
+  - healthy official stock result:
+    - run `stock-base-fp16-mini-control`
+  - weak or abnormal official stock result:
+    - run `stock-base-fp16-official-subsample-c1`
+- Current orchestrator read:
+  - official stock eval is still running at about `71/150`
+  - no post-run summary exists yet, so runtime quality branching is still blocked on the official result
+- Follow-up assigned in this pass:
+  - keep the two post-official runtime branches current
+  - do not start GPU work before the official stock result lands
+
+## 2026-04-09 Runtime Hold Under DNS Blocker
+
+- This pass did not launch any runtime-side run.
+- The single gating preflight for this pass was a direct SSH reachability check, and it failed on DNS resolution for:
+  - `connect.bjb1.seetacloud.com`
+- Fresh runtime delivery in this pass:
+  - blocker report from the replacement runtime worker
+  - local alias expansion still passes, so the blocker is narrowed to DNS/reachability rather than SSH config text
+- Follow-up assigned in this pass:
+  - runtime side stays paused until DNS/reachability recovers or the official stock result becomes readable again
+
+## 2026-04-09 Runtime Third Possibility, Kept Bounded
+
+- Fresh runtime delivery in this pass:
+  - third possibility:
+    - one single-point sanity A/B using the existing runner:
+      - `stock-base-fp16-mini-control-nodense`
+    - this changes only:
+      - `--no-dense-as-sparse`
+- Trigger condition:
+  - only if the main post-official runtime branches remain weak or ambiguous
+  - do not expand into a wider runtime sweep
+- Follow-up assigned in this pass:
+  - keep this third possibility bounded as fallback-only
+
+## 2026-04-09 Runtime Blocker Reconfirmed
+
+- Direct remote runtime follow-up remained blocked in this pass by local DNS failure for:
+  - `connect.bjb1.seetacloud.com`
+- No runtime-side GPU work was started.
+- Runtime implication:
+  - keep the bounded post-official branches as-is
+  - do not broaden runtime exploration until reachability and the official stock result are both available
+
+## 2026-04-09 Runtime Minimal Support During Quant Focus
+
+- Current official stock eval is still healthy, but one step has become noticeably slower.
+- Runtime interpretation in this pass:
+  - treat this first as a possible long-sample effect
+  - do not promote it into a new runtime regression claim while the run still shows `200 OK` and no new hard failures
+- Follow-up assigned in this pass:
+  - stay in minimal-support mode only
+
+## 2026-04-09 Runtime Replacement Worker: SSH Alias Gate
+
+- Latest no-GPU runtime gate:
+  - `ssh -G rtx6000-2 | sed -n '1,20p'`
+- Result:
+  - alias expansion is correct
+  - `host` resolves to `connect.bjb1.seetacloud.com`
+  - `port` resolves to `50884`
+- Interpretation:
+  - the blocker is still DNS/reachability to the remote host, not local SSH alias config
+  - the runtime-side post-official A/B is not runnable from this machine until that blocker clears
+
+## 2026-04-09 Post-Official Minimal Precision Attribution
+
+- Ground truth for this phase:
+  - the official full eval is still running
+  - the public set actually exercised here has only these populated input buckets:
+    - `0-4K`
+    - `16K-32K`
+    - `32K-128K`
+  - so post-official attribution should focus on quality consistency, not on trying to explain missing `4K-16K` or `128K-160K` behavior from this run
+
+- Minimal attribution flow after the official result lands:
+  - first read the official result as the quality truth for the route
+  - then run one local serial control pair with identical stable serve flags
+  - in that pair, change only:
+    - `--model-path`
+    - `--quantization`
+  - if base control is healthy and the quantized route drops, blame quantization first
+  - if both are similarly weak, inspect serve flags or local harness before blaming quantization
+
+- First control experiment is fixed as a serial A/B:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label base-fp16-mini-eval-control \
+  --model-path /root/autodl-tmp/models \
+  --quantization none \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label <CANDIDATE_LABEL>-mini-eval-control \
+  --model-path <CANDIDATE_MODEL_PATH> \
+  --quantization <none|modelopt|gptq> \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile mini-eval
+```
+
+- Rule for this control pair:
+  - do not change `dtype`, `attention-backend`, `chunked-prefill-size`, `dense-as-sparse`, `disable-radix-cache`, or `disable-cuda-graph`
+  - otherwise the first attribution step is no longer isolating quantization from serve-path effects
+
+## 2026-04-09 Post-Official Fast Proxy Eval
+
+- Added runner support for a post-official directional quality proxy:
+  - profile:
+    - `fast-eval`
+  - file:
+    - `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+- Design goal:
+  - faster and more representative than the old `fast_test.sh` smoke
+  - still explicitly weaker than official full eval
+  - safe to run only after the current official/full-eval chain finishes
+- Fixed subset plan:
+  - `mcq`:
+    - `4` rows from `0-4K`
+  - `qa / niah / fwe / cwe`:
+    - each `1` row from `16K-32K`
+    - each `2` rows from `32K-128K`
+  - total:
+    - `16` rows
+- Why this is preferable to the current smoke:
+  - it keeps all five tasks
+  - it includes both mid-long and long buckets that actually exist in the public set on disk
+  - it stays small enough for fast post-official iteration
+- Remote subset is already materialized:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_fast_eval.jsonl`
+  - `16` rows
+  - task counts:
+    - `mcq: 4`
+    - `qa: 3`
+    - `niah: 3`
+    - `fwe: 3`
+    - `cwe: 3`
+- Launch helper prepared:
+  - `/Users/ql/cursor/openbmb/scripts/run_fast_eval_remote.sh`
+  - usage:
+    - `bash /Users/ql/cursor/openbmb/scripts/run_fast_eval_remote.sh <label> <model_path> <quantization>`
+
+## 2026-04-09 Official Full-Eval Result Extraction Template
+
+```bash
+LOG_DIR=/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318 && \
+grep -E "Average Score:|Total Duration:|Request failed|ERROR|Traceback" "$LOG_DIR"/*.log 2>/dev/null || true
+```
+
+```bash
+LOG_DIR=/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318 && \
+tail -n 80 "$LOG_DIR"/*.log 2>/dev/null
+```
+
+- Live check in this pass:
+  - official stock eval is still running
+  - no `Average Score` / `Total Duration` / `Request failed` / `ERROR` / `Traceback` summary lines are present yet
+  - latest visible signal is healthy in-flight decode activity from `server.log`
+
+## 2026-04-09 Runtime Minimal-Support Follow-Up
+
+- This pass did not open any new runtime A/B branch.
+- Fresh runtime delivery in this pass:
+  - keep the first post-official control fixed as:
+    - `base-fp16-mini-eval-control`
+- Fresh runtime follow-up delivery in this pass:
+  - exact first official-result extraction command:
+
+```bash
+LOG_DIR=/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318 && (grep -E "Average Score:|Total Duration:|Request failed|ERROR|Traceback" "$LOG_DIR"/*.log 2>/dev/null || true) && tail -n 80 "$LOG_DIR"/*.log 2>/dev/null
+```
+
+- Worker delivery in this pass:
+  - yes
+- Worker follow-up assigned in this pass:
+  - yes
+
+## 2026-04-09 Runtime Rediscovery Rule After Lost Tmux State
+
+- Fresh runtime delivery in this pass:
+  - if Marlin proxy is low after healthy stock official and base fast, the next control remains:
+    - `base-fp16-mini-eval-control`
+- Cheap preflight blocker in this pass:
+  - remote `tmux` windows expected for:
+    - `stock-official-eval`
+    - `quant-v2-queue`
+  - were both missing
+- Therefore:
+  - do not start `fast` or `mini` from this pass
+  - first recover authoritative run directories
+- Fresh runtime follow-up delivery in this pass:
+  - first rediscovery command:
+    - `ssh rtx6000-2 'cd /root/autodl-tmp/SOAR-Toolkit/test_results && ls -td official_stock_base_* quant_* 2>/dev/null | head -n 10'`
+  - runtime-side reason:
+    - re-establish the latest result directories without depending on tmux survival
+
+## 2026-04-09 Fast-Proxy Budget Fix Landed
+
+- Fresh runtime delivery in this pass:
+  - the current `fast` budget path is wrong for proxy gating
+  - fix proposal:
+    - use the patched `mini_test.sh`
+    - enforce task-aware caps:
+      - `mcq=64`
+      - `qa/niah=128`
+      - `fwe/cwe=256`
+- Cheap preflight confirmed in this pass:
+  - `run_remote_candidate_bench.py` already had:
+    - `FAST_EVAL_TASK_CAPS`
+    - `task_caps` plumbing into `run_mini_eval(...)`
+  - but `run_mini_eval(...)` still invoked the stock remote `mini_test.sh`
+- Fix completed in this pass:
+  - updated `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - new behavior:
+    - when `task_caps` is set, the runner uploads `/Users/ql/cursor/openbmb/soar-patches/mini_test.sh`
+    - then runs that patched script remotely
+    - so `fast-eval` will finally honor `EVAL_TASK_MAX_TOKENS`
+- Why this matters:
+  - the previous path let a short-MCQ proxy item inherit `completion_tokens=2767`
+  - that turned a cheap sanity gate into a multi-thousand-token generation test
+
+## 2026-04-09 Runtime Follow-Up: Post-Official Sanity Sequence Tightened
+
+- Fresh runtime delivery in this pass:
+  - keep the post-official quality cross-check strictly serial:
+    1. `base fast-eval`
+    2. `quant fast-eval`
+    3. only if both are technically healthy, `quant mini-eval`
+- Additional runtime follow-up delivery in this pass:
+  - if:
+    - `base fast-eval` is technically healthy
+    - but `quant fast-eval` is weak
+  - then the lowest-cost runtime-side sanity check is:
+    - same serve flags
+    - only change `model-path/quantization`
+    - run:
+      - `base mini-eval`
+      - `quant mini-eval`
+  - concrete command family:
+    - `python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py --label <label> --model-path <path> --quantization <none|modelopt|gptq> --dtype float16 --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --disable-radix-cache --disable-cuda-graph --dense-as-sparse --profile mini-eval`
+- Harness hardening completed in this pass:
+  - updated `/Users/ql/cursor/openbmb/scripts/run_quant_fast_queue.sh`
+  - new queue behavior:
+    - abort the quant queue if `base fast` has technical failures or no summary
+    - skip `mini` if `quant fast` shows technical failures, missing summary, or non-zero `empty=`
+- synced deployed copy to:
+  - `/root/autodl-tmp/codex-drafts/nvfp4-mlp-only-draft/run_quant_fast_queue.sh`
+
+## 2026-04-09 Runtime Bug Fixes After Official Exit
+
+- New abnormal stock result in this pass:
+  - the stock official process ended, but:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260409_034351`
+    - is empty
+  - so this stock official run cannot be treated as a valid quality anchor yet
+- Queue bug found and fixed in this pass:
+  - `run_quant_fast_queue.sh` kept waiting even after official exited
+  - root cause:
+    - `pgrep -af` wait expressions could self-match the queue shell context
+  - fix:
+    - replaced the wait loop with:
+      - `official_eval_active()`
+      - `stock_server_active()`
+    - both now use `ps ... | awk` and explicitly ignore the queue script itself
+  - synced deployed copy:
+    - `/root/autodl-tmp/codex-drafts/nvfp4-mlp-only-draft/run_quant_fast_queue.sh`
+- `fast` harness bug found and fixed in this pass:
+  - the first rerun of:
+    - `stock-base-fast-eval`
+  - failed with:
+    - `NameError: name 'k' is not defined`
+  - root cause:
+    - the remote helper script builder in `run_remote_candidate_bench.py` embedded a dict comprehension inside an outer f-string
+  - fix:
+    - rewrote the JSON serialization line to avoid brace interpolation
+    - `py_compile` passed after the patch
+- New active runtime control run:
+  - label:
+    - `stock-base-fast-eval`
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_045057_stock-base-fast-eval`
+  - live evidence after the fix:
+    - `fast_eval.log` shows the fixed 16-row proxy set selection
+    - `server.log` shows stock server load complete and requests started
+
+## 2026-04-09 Runtime Gate Fix: Task-Aware Caps For `fast`
+
+- New proxy-quality bug confirmed in this pass:
+  - even after the remote-script `NameError` fix, `stock-base-fast-eval` still gave short `mcq` samples:
+    - `req_out=2767`
+  - that made the proxy effectively behave like an unintended long-generation test
+- Fix completed in this pass:
+  - patched `/Users/ql/cursor/openbmb/soar-patches/mini_test.sh`
+    - added optional `EVAL_TASK_MAX_TOKENS`
+    - task-aware caps:
+      - `mcq=64`
+      - `qa=128`
+      - `niah=128`
+      - `fwe=256`
+      - `cwe=256`
+  - patched `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+    - `fast-eval` now exports those caps only for that profile
+  - patched `/Users/ql/cursor/openbmb/scripts/run_quant_fast_queue.sh`
+    - both base and quant `fast` phases now use the same caps
+  - synced remote copies:
+    - `/root/autodl-tmp/SOAR-Toolkit/mini_test.sh`
+    - `/root/autodl-tmp/codex-drafts/nvfp4-mlp-only-draft/run_quant_fast_queue.sh`
+- New capped control run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_045846_stock-base-fast-eval-capped`
+- First observed capped rows:
+  - `mcq` rows now request `64`, not `2767`
+  - no server error is present in the observed prefix
+  - therefore:
+    - `fast` is now usable as a directionality gate
+    - but the stock base quality on this proxy still appears low
+
+## 2026-04-09 Post-Official Fast Proxy Eval Subset Proposal
+
+- Suggested fixed proxy subset size:
+  - `20` questions total
+- Suggested task/length quota:
+  - `mcq`: `4` from `0-4K`
+  - `qa`: `2` from `16K-32K`, `4` from `32K-128K`
+  - `niah`: `2` from `16K-32K`, `4` from `32K-128K`
+  - `fwe`: `1` from `16K-32K`, `1` from `32K-128K`
+  - `cwe`: `1` from `16K-32K`, `1` from `32K-128K`
+- Why this quota:
+  - it keeps `mcq` present but prevents the cheap `0-4K` bucket from dominating the proxy
+  - it preserves the observed public-set shape where the long-context burden is mainly in `qa/niah/fwe/cwe`
+  - it intentionally over-weights `qa/niah` because they are both common and sensitive to long-context quality loss
+  - it keeps `fwe/cwe` in the proxy so formatting/retrieval regressions still show up, but at low enough count that they do not dominate runtime cost
+  - `20` total is still much cheaper than full official eval, but materially more representative than the current `smoke`
+
+## 2026-04-09 Post-Official `fast-eval` Command
+
+- Fixed remote dataset:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_fast_eval.jsonl`
+- Exact post-official command:
+
+```bash
+python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py \
+  --label <LABEL>-fast-eval \
+  --model-path <MODEL_PATH> \
+  --quantization <none|modelopt|gptq> \
+  --dtype float16 \
+  --attention-backend minicpm_flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-radix-cache \
+  --disable-cuda-graph \
+  --dense-as-sparse \
+  --profile fast-eval
+```
+
+- Usage boundary:
+  - `fast-eval` is only for directional post-official judgment
+  - it can help rank nearby candidates quickly after an official result lands
+  - it cannot replace or overrule the official full eval
+- Current execution strategy for this thread:
+  - because the user explicitly asked for `eval` to be followed by a non-disruptive `fast_eval` before continuing quantization, the active remote queue is allowed to auto-run one base `fast-eval` immediately after the stock official eval finishes
+  - treat that as a single bounded cross-check, not a general precedent for inserting more proxy runs ahead of official work
+- Queue policy lock:
+  - historical default was to keep post-official `fast-eval` manual-only
+  - for the current thread, this is superseded by the active remote queue because the user explicitly wants:
+    - official eval -> bounded non-disruptive `fast_eval` -> continue quantization
+  - local sandbox SSH preflight is currently unavailable, so no new remote-state assumption should be made from that older pass alone
+- One-line post-official execution rule:
+  - stock official healthy end -> base `fast-eval` -> quant `fast-eval` -> if both are technically healthy, then `mini-eval`; if any step is technically abnormal, fix harness/serve first and do not directly call the model route worse
+
+## 2026-04-09 Post-Official Summary Template
+
+- official: `Average Score=<...>%`, `Total Duration=<...>s`
+- technical health: `healthy` / `abnormal` with top error keyword
+- base fast: `<score/status>`
+- quant fast: `<score/status>`
+- next action: `mini-eval` / `fix harness/serve` / `resume quant queue`
+
+## 2026-04-09 One-Line Official Result Extraction
+
+```bash
+LOG_DIR=/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318 && ((grep -E "Average Score:|Total Duration:|Request failed|ERROR|Traceback" "$LOG_DIR"/*.log 2>/dev/null || true) && echo "__TAIL__" && tail -n 80 "$LOG_DIR"/*.log 2>/dev/null)
+```
+
+## 2026-04-09 Speed Gate
+
+- 只有当某条量化路线已经拿到技术健康的 official full eval，且本地 `fast-eval` / `mini-eval` 与 official 方向一致时，才允许切到速度优化。
+- 只要 official 未落地、存在技术异常，或本地交叉验证与 official 明显冲突，就继续留在精度线，先修量化或 harness/serve。
+- 速度优化只能发生在“精度结论已基本稳定”之后，不能反过来替代精度判断。
+
+## 2026-04-09 Queue Policy Reaffirmed Under SSH Blocker
+
+- Fresh runtime delivery in this pass:
+  - keep post-official `fast-eval` manual-only
+  - do not auto-insert it ahead of the main quant sequence
+- Reason recorded in this pass:
+  - it is directional only
+  - it adds latency and another failure point without changing the official quality conclusion
+- Cheap preflight blocker in this pass:
+  - fresh direct remote SSH from the current sandbox failed with:
+    - `Operation not permitted`
+- Therefore:
+  - do not infer new remote queue state from this pass
+  - keep the queue policy unchanged
+
+## 2026-04-09 Runtime Blocker Corrected: `fast-eval` Already Exists
+
+- Fresh runtime delivery in this pass initially claimed:
+  - `run_remote_candidate_bench.py` did not implement `fast-eval`
+- Follow-up assigned in this pass:
+  - re-check the current local file state and either prove the blocker or correct it
+- Fresh runtime follow-up delivery in this pass corrected the blocker:
+  - `fast-eval` already exists in `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - cited evidence:
+    - argparse profile choice
+    - dataset constant:
+      - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_fast_eval.jsonl`
+    - helper:
+      - `ensure_fast_eval_dataset()`
+    - dispatch branch
+    - execution branch
+- Correct next runtime handoff remains:
+  - `python3 /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py --label stock-base-fast-eval --model-path /root/autodl-tmp/models --quantization none --dtype float16 --attention-backend minicpm_flashinfer --chunked-prefill-size 8192 --disable-radix-cache --disable-cuda-graph --dense-as-sparse --profile fast-eval`
+- New blocker in this pass:
+  - fresh direct-IP remote reachability check from this sandbox failed with:
+    - `Operation not permitted`
+- Therefore:
+  - do not treat `fast-eval` support as a blocker anymore
+  - the active blocker for this pass is sandbox SSH reachability, not runtime runner wiring
+- Worker delivery in this pass:
+  - yes
+- Worker follow-up assigned in this pass:
+  - yes
+
+## 2026-04-09 Attempt: Direct-IP `gptq` Marlin Smoke Gate
+
+- Status:
+  - blocked before any stable smoke eval could run
+- Why this was chosen:
+  - quant logs kept `W4A16 + GPTQ + Marlin` as the next champion-aligned route
+  - the local GPTQ checkpoint already exists, so the first read should be a cheap smoke gate, not a new quantization pass
+- Remote access used in this pass:
+  - DNS for `rtx6000-2` remained flaky, so I reused the previously recovered direct fallback:
+    - `root@106.120.183.117:50884`
+- Stock official-eval gate:
+  - the earlier full stock-base eval at `/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_034318` was technically healthy in flight
+  - it continued to show `200 OK` with no visible `Request failed`, `Traceback`, or `ERROR`
+  - to free the single serialized slot for this pass, I terminated that older full-eval/server pair after capturing that health read
+- First launch attempt:
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/manual_marlin_smoke_ip_20260409`
+  - command intent:
+    - local GPTQ checkpoint
+    - stock import path
+    - `--quantization gptq_marlin`
+  - result:
+    - immediate argument/config mismatch
+  - blocker:
+    - `ValueError: Quantization method specified in the model config (gptq) does not match the quantization method specified in the quantization argument (gptq_marlin).`
+- Second launch attempt:
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/manual_marlin_smoke_ip_gptq_20260409`
+  - corrected only:
+    - `--quantization gptq`
+  - result:
+    - launch progressed into weight loading, then failed
+  - blocker:
+    - `KeyError: 'model.layers.1.self_attn.z_proj.weight'`
+- Import-path isolation:
+  - `/root/autodl-tmp/sglang/sglang_minicpm_sala_env/bin/python3` imports:
+    - default: `/root/autodl-tmp/sglang-stock/python/sglang/launch_server.py`
+    - with `PYTHONPATH=/root/autodl-tmp/sglang/python`: `/root/autodl-tmp/sglang/python/sglang/launch_server.py`
+- Third launch attempt:
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/manual_marlin_smoke_ip_gptq_live_20260409`
+  - corrected only:
+    - forced the live custom tree with `PYTHONPATH=/root/autodl-tmp/sglang/python`
+    - kept `--quantization gptq`
+  - result:
+    - same load-time failure
+  - blocker:
+    - `KeyError: 'model.layers.1.self_attn.z_proj.weight'`
+- Prepared-model handoff:
+  - existing quant-side materialization step succeeded:
+    - `bash /root/autodl-tmp/codex-drafts/w4a16-marlin-draft/prepare_model.sh --input /root/autodl-tmp/models --output /root/autodl-tmp/models-gptq-marlin-local-prepared`
+  - output path:
+    - `/root/autodl-tmp/models-gptq-marlin-local-prepared`
+- Fourth launch attempt:
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/manual_marlin_smoke_ip_prepared_20260409`
+  - corrected only:
+    - prepared model path plus live custom tree plus `--quantization gptq`
+  - result:
+    - server still died during load
+  - blocker:
+    - `KeyError: 'model.layers.1.self_attn.z_proj.weight'`
+- Runtime conclusion from this pass:
+  - the active Marlin blocker is now narrowed to checkpoint/model-schema compatibility
+  - it is not primarily:
+    - the remote SSH path
+    - `gptq_marlin` vs `gptq` launch arg naming
+    - stock-vs-live SGLang import path
+- Metrics collected:
+  - no stable smoke correctness metric was collected because no launch survived long enough to run `fast_test.sh --eval-only`
+  - strongest in-flight runtime signal came from the earlier stock-base full eval before it was stopped:
+    - sustained `200 OK`
+    - no visible hard failure markers
+- End-of-pass note:
+  - final read-only check showed a new base-model `mini_test.sh` plus base `sglang.launch_server` on port `30001`
+  - that means the remote GPU was no longer clean for another serialized run at the end of this pass
+- Next runtime action:
+  - inspect why the GPTQ checkpoint family lacks the loader-expected `z_proj` weights
+  - if the checkpoint naming is recoverable, add the required remap/materialization fix before retrying this same Marlin smoke gate
+
+## 2026-04-09 Runtime Follow-Up After Fast-Proxy Runner Patch
+
+- Fresh runtime delivery in this pass:
+  - accept the patched `fast` runner path as runnable
+  - concrete evidence:
+    - `run_remote_candidate_bench.py` defines `FAST_EVAL_TASK_CAPS`
+    - when `task_caps` is set, it uploads and runs the patched remote `mini_test.sh`
+    - the `fast-eval` branch passes `task_caps=FAST_EVAL_TASK_CAPS`
+    - local `py_compile` for the runner passed
+- Cheap preflight completed in this pass:
+  - `python3 -m py_compile /Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+  - result:
+    - passed
+- Non-blocking side observation:
+  - `py_compile` on `/Users/ql/cursor/openbmb/soar-patches/mini_test.sh` failed only because the file is a shell script
+- First runtime proof check after this pass:
+  - after the next base `fast-eval`, inspect `fast_eval.log`
+  - confirm short `mcq` rows use capped `req_out`, not the old `2767`
+- Follow-up assigned in this pass:
+  - yes
+- Follow-up acknowledgement received in this pass:
+  - yes
+
+## 2026-04-09 Runtime Hold Rule After Sandbox-Blocked Marlin Metadata Check
+
+- Fresh runtime delivery in this pass:
+  - do not relaunch `Marlin` with either:
+    - `--quantization gptq_marlin`
+    - `--quantization gptq`
+  - reason:
+    - `gptq_marlin` is already blocked at the quantization-method config check
+    - `gptq` already got past that check before and then died later on:
+      - `KeyError: 'model.layers.1.self_attn.z_proj.weight'`
+- Cheap preflight attempted in this pass:
+  - read-only remote metadata inspection for the prepared `Marlin` checkpoint
+- Result:
+  - blocked at the local sandbox layer:
+    - `ssh: connect to host 106.120.183.117 port 50884: Operation not permitted`
+- Therefore:
+  - runtime retries are frozen from this pass
+  - the next useful move remains on the quant/materialization side after trusted SSH returns
+- Follow-up assigned in this pass:
+  - yes
+- Follow-up acknowledgement received in this pass:
+  - yes
+
+## 2026-04-09 Runtime Hold Rule After Medium-Eval Status Check Failed At Sandbox Layer
+
+- Fresh runtime delivery in this pass:
+  - after `medium-eval`, do not launch any next runtime A/B until there is one trusted read of:
+    - `eval_model.log`
+    - output / summary files
+  - if SSH is still blocked with `Operation not permitted`, treat runtime state as unknown and keep runtime on no-launch hold
+- Cheap preflight attempted in this pass:
+  - one direct remote status read for the active `medium-eval`
+- Result:
+  - blocked at the sandbox layer:
+    - `ssh: connect to host 106.120.183.117 port 50884: Operation not permitted`
+- Replacement worker note:
+  - one replacement runtime worker later produced an untrusted destructive claim about remote directory deletion
+  - because this pass had no trusted SSH read, that claim was discarded and the replacement worker was closed
+- Therefore:
+  - runtime stays on no-launch hold from this pass
+  - the next valid runtime action is still one trusted post-run read of `medium-eval` artifacts
+- Follow-up assigned in this pass:
+  - yes
+- Follow-up acknowledgement received in this pass:
+  - yes
+
+## 2026-04-09 Runtime Delivery After Local Medium-Eval Readiness Patch
+
+- Fresh runtime delivery in this pass:
+  - yes
+- One cheap preflight executed:
+  - patched:
+    - `/Users/ql/cursor/openbmb/scripts/run_medium_eval_remote.sh`
+  - replaced fixed sleep with readiness polling against `/v1/models`
+  - if readiness never arrives, the launcher now kills the started server and exits
+  - local validation:
+    - `bash -n /Users/ql/cursor/openbmb/scripts/run_medium_eval_remote.sh` passed
+- Runtime handoff after that patch:
+  - keep the next local guardrail narrowed to one change only:
+    - persist the successful `/v1/models` payload to `$RUN_DIR/model_probe.json`
+    - require a non-empty model id before launching `eval_model.py`
+- No broader runtime branch was opened in this pass.
+- Follow-up assigned in this pass:
+  - yes
+- Follow-up acknowledgement received in this pass:
+  - yes
+
+## 2026-04-09 Runtime Trust Gate Before Next Medium-Eval Launch
+
+- Fresh runtime delivery in this pass:
+  - the local `medium-eval` launcher is already patched from fixed sleep to readiness polling and passes `bash -n`
+- Exactly one next runtime follow-up:
+  - before any new `medium-eval`, make the launcher fail closed unless `/v1/models` returns at least one non-empty model id, and use that returned id for the eval invocation instead of trusting model auto-detect
+- Why this is the trust gate:
+  - it covers both prior launch-failure signatures in one cheap preflight:
+    - `127.0.0.1:30001 ... connection refused`
+    - `Could not auto-detect model name`
+  - a bare readiness `200 OK` is weaker than a verified non-empty model-id gate
+- Heavy run status in this pass:
+  - none
+- Follow-up assigned in this pass:
+  - yes
+- Follow-up acknowledgement received in this pass:
+  - yes
+
+## 2026-04-09 Stock Base Medium-Eval Result And Runtime Caveat
+
+- Completed run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/medium_eval_stock_base_20260409_104835`
+- Output:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260409_104905`
+- Final summary:
+  - `Original Accuracy: 50.40%`
+  - `Normalized Accuracy: 63.0%`
+  - `Total Duration: 2405.74 s`
+  - `TPS: 178.88`
+- Runtime conclusion:
+  - the launcher/readiness fix worked; this run completed cleanly
+  - however, this medium-eval is not a clean speed benchmark because generation was effectively uncapped for some tasks
+- Evidence of duration pollution:
+  - sample `39` output tokens:
+    - `65545`
+  - sample `45` output tokens:
+    - `65545`
+  - combined:
+    - `131090 / 430343` output tokens
+    - about `30.5%` of all generated output tokens came from `2/50` samples
+- Practical implication:
+  - use this run as a correctness/control anchor
+  - do not use its duration directly to compare runtime optimizations
+  - for runtime comparisons, prefer capped `fast` or dedicated bench datasets
+
+## 2026-04-09 Runtime Bench Policy Shift
+
+- Old `fast` artifacts were removed from remote and are no longer the active quick gate.
+- New quick correctness gate:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_fast_eval.jsonl`
+- Why:
+  - it is a direct subset of the validated `medium_eval` set
+  - it uses the official `eval_model.py` path instead of the patched mini-test path
+  - it keeps exact task balance:
+    - `4` samples per task
+- New intended interpretation:
+  - `fast-eval`:
+    - quick correctness direction
+  - `medium-eval`:
+    - stronger correctness anchor
+  - dedicated bench datasets:
+    - speed judgment
+
+## 2026-04-09 Runtime Interpretation Of The Failed BF16 NVFP4 Route
+
+- The first fresh `NVFP4 mlp_weight_only + bfloat16 + 32K + 64` route should not be treated as a clean accuracy datapoint.
+- Why:
+  - quantization/export completed
+  - but the first online eval batch crashed the server
+  - fast and medium logs therefore read as:
+    - `0.00%`
+    - because the server died, not because the model cleanly answered every row wrong
+- Runtime warning sequence worth remembering:
+  - `DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0`
+  - `Casting torch.bfloat16 to torch.float16`
+  - then:
+    - `CUDA illegal memory access`
+- Runtime implication:
+  - the most plausible next runtime probe is not a new broad sweep
+  - it is a narrow retry with:
+    - `float16` export
+    - `float16` serve dtype
+    - `DeepGemm disabled`
+
+## 2026-04-09 Fast-Eval Gate Corrected To Avoid Runaway Outputs
+
+- The first medium-derived `fast-eval v2` still had a design flaw:
+  - it kept the original sample `completion_tokens`
+  - so a supposedly quick gate could still get trapped in long runaway generations
+- Corrected policy:
+  - keep the same medium-derived rows
+  - keep `4` rows per task
+  - cap completion tokens per task:
+    - `mcq=64`
+    - `qa=128`
+    - `niah=128`
+    - `fwe=256`
+    - `cwe=256`
+- Intended use:
+  - `fast-eval` becomes a real quick gate again
+  - `medium-eval` stays the stronger quality anchor
+
+## 2026-04-09 Runtime/Harness Naming Cleanup
+
+- Active quick gate is now named only:
+  - `fast`
+- Active dataset:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_fast_eval.jsonl`
+- Active launcher helper:
+  - `/Users/ql/cursor/openbmb/scripts/run_fast_eval_remote.sh`
+- Active quant queue helper:
+  - `/Users/ql/cursor/openbmb/scripts/run_quant_fast_queue.sh`
+- Repaired stock-base control now running on the unified `fast` gate:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_175739_stock-base-fast-eval`
+- Runtime state at log time:
+  - live server on original weights
+  - live `eval_model.py`
+  - GPU busy rather than idle
+  - so the current `fast` harness is behaving like a real bounded eval, not a dead launcher
+
+## 2026-04-09 GPTQ Fast Tail Attribution
+
+- For the live `gptq_marlin` `fast` run, the tail currently looks `decode-heavy`, not `prefill-heavy`.
+- Why:
+  - progress already reached `8/9` in `eval_model.log`
+  - sampling kwargs still allow `max_tokens=65536`
+  - the run has over-length prompt warnings but no request-time stats that would indicate a prefill stall
+  - GPU utilization around `38%` is consistent with batch collapse onto one or two long decode requests
+- Caveat:
+  - current server args still have `enable_request_time_stats_logging=False`
+  - so the existing `server.log` is not sufficient for an exact per-request prefill/decode breakdown
+
+## 2026-04-09 Fast Runtime Visibility + Cap Fix
+
+- Root cause of the overly slow `fast` gate:
+  - the active `fast-eval` path was still routed through official `eval_model.py`
+  - official `eval_model.py` hardcodes `model.generate(inputs, max_out_len=65536)`
+  - so curated per-task caps in `perf_public_fast_eval.jsonl` were not taking effect
+- Runtime-facing fix:
+  - `fast-eval` in `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py`
+    now uses patched `/Users/ql/cursor/openbmb/soar-patches/mini_test.sh`
+    with:
+    - `EVAL_USE_ALL_ROWS=1`
+    - task-aware `EVAL_TASK_MAX_TOKENS`
+  - `fast-eval` now auto-adds:
+    - `--enable-request-time-stats-logging`
+- Resulting expectation for future `fast` runs:
+  - real capped output lengths
+  - finer-grained request-time stats from SGLang
+  - much less risk of a single long decode turning `fast` into a 10-minute pseudo-medium run
+
+## 2026-04-09 Stock Fast Rerun Validation
+
+- A fresh stock-base `fast` rerun was launched after the harness fix:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260409_200504_stock-base-fast-eval-rerun`
+- Early live output already validates the fix:
+  - `mcq` is now truly capped at `req_out=64`
+  - `qa` is now truly capped at `req_out=128`
+  - `fwe` is now truly capped at `req_out=256`
+- Early latencies are correspondingly bounded:
+  - `2.49s`, `6.17s`, `8.88s`
+- The stock server is also running with:
+  - `--enable-request-time-stats-logging`
+  so later server-side timing attribution should be possible without another harness rewrite.
+
+## 2026-04-10 MiniCPM Sparse Bypass For Py310 GPTQ Eval
+
+- Confirmed by source inspection and remote repro:
+  - `flash_attn` alone does not replace `sparse_kernel_extension` for MiniCPM-SALA
+  - both `minicpm_flashattn` and `minicpm_flashinfer` still route through `MiniCPMSparseBackend`
+  - `MiniCPMSparseBackend` imports `sparse_kernel_extension` and `tilelang` unconditionally
+- Confirmed a viable runtime bypass for eval:
+  - use dense backend instead of sparse MiniCPM backend
+  - launcher change:
+    - from `--attention-backend minicpm_flashinfer --dense-as-sparse`
+    - to `--attention-backend flashinfer --force-dense-minicpm`
+- Dense path still requires `SimpleGLAAttnBackend` support for lightning layers:
+  - copied `fla` from the py310 GPTQ env into the py310 eval env
+- Dense `flashinfer` path also required:
+  - `ninja` available on `PATH`
+  - corrected harness env names for the patched `mini_test.sh`
+- After these changes, py310 GPTQ fast eval progressed past:
+  - sparse-kernel import failures
+  - `fla` missing
+  - `ninja` missing
+  - wrong fast dataset env wiring
+- Latest active run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_fastcheck_20260410_130050`
+- Verified live progress:
+  - server ready
+  - fast subset = `9` items
+  - first request completed with request-time stats logged by SGLang
+
+## 2026-04-10 Dense-Fallback GPTQ Fast Completed
+
+- The dense `flashinfer + force_dense_minicpm` fallback completed the full `9`-sample bounded fast gate.
+- Final run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_fastcheck_20260410_142000`
+- Final score:
+  - `avg_score=46.67%`
+- This validates a practical py310 evaluation route that does not depend on:
+  - `MiniCPMSparseBackend`
+  - `sparse_kernel_extension`
+  - `tilelang`
+- Important caveat:
+  - this is a compatibility-first fallback, not a proof that dense runtime is the final best competition route
+  - for now it is the cleanest path to submission environment validation

@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+cache/
+automation/logs/
+runtime_envs/
+
+*.whl
+*.tar.gz
+
+submission-drafts/*/wheels/
+submission-drafts/*/runtime_envs/
+

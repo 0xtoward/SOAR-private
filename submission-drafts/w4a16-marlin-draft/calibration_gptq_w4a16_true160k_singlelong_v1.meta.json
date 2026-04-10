@@ -1,0 +1,37 @@
+{
+  "count": 49,
+  "bucket_counts": {
+    "0-4K": 12,
+    "128K-160K": 1,
+    "16K-32K": 12,
+    "32K-128K": 24
+  },
+  "source_counts": {
+    "pg19_local": 1,
+    "soar_public": 48
+  },
+  "task_counts": {
+    "cwe": 4,
+    "fwe": 4,
+    "mcq": 12,
+    "niah": 14,
+    "open_text": 1,
+    "qa": 14
+  },
+  "raw_tokens": {
+    "p50": 36838,
+    "p90": 127114,
+    "max": 192399
+  },
+  "calib_tokens": {
+    "p50": 36838,
+    "p90": 127114,
+    "max": 160000
+  },
+  "kept_long_row": {
+    "source": "pg19_local",
+    "task": "open_text",
+    "raw_prompt_tokens": 192399,
+    "calib_prompt_tokens": 160000
+  }
+}
