@@ -2644,3 +2644,1605 @@ ssh rtx6000-2 'source /root/autodl-tmp/use_soar_uv.sh >/dev/null 2>&1 && pkill -
   - quantization then uses this patched dir as `--model-path`
   - `HF_MODULES_CACHE` is redirected under `runtime_envs/` to avoid reusing stale platform caches
 - This is a stronger fix than only mutating config fields because it bypasses potentially older remote-code copies entirely.
+
+## 2026-04-10 Stop-Boundary Follow-Up On Quantized Py310 Checkpoint
+
+- Scope rule for this pass:
+  - did not modify `eval_model.py`
+  - did not touch submission packaging
+  - used the existing quantized checkpoint only:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-quantcheck`
+- Verified current checkpoint / eval interaction:
+  - `generation_config.json` keeps:
+    - `eos_token_id=[2, 73440]`
+    - `repetition_penalty=None`
+  - tokenizer decode confirms:
+    - `'</s>'`
+    - `'<|im_end|>'`
+  - therefore the over-generation problem is not a bad stop-token decode bug
+- Fresh quant-side read from the dense-fallback medium outputs:
+  - the `8` worst rows still account for:
+    - `323311 / 330508` output tokens
+  - concentrated tasks:
+    - `cwe x3`
+    - `fwe x1`
+    - `mcq x4`
+  - this reinforces the earlier thesis that the current GPTQ route's main weakness is stop-boundary stability, not raw Marlin throughput
+- Runtime-only diagnostic ablation on the same `8` rows:
+  - dataset:
+    - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_medium_overgen8_eval_v1.jsonl`
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_overgen8_rp105_20260410_172432`
+  - serve delta:
+    - `REPETITION_PENALTY=1.05`
+  - eval logic remained unchanged
+- What this ablation proved, even without final score writeout:
+  - request-time stats for all `8` requests were emitted by the server
+  - total output length on the same subset fell:
+    - `323311 -> 142756`
+    - about `-55.8%`
+  - biggest wins were exactly the worst extraction-style tails:
+    - `cwe`: `65541 -> 688`
+    - `fwe`: `65545 -> 1124`
+    - `cwe`: `65538 -> 43752`
+    - `cwe`: `65544 -> 43752`
+  - `mcq` was mixed, including one regression:
+    - `6661 -> 15326`
+- Quantization-side interpretation:
+  - this supports the user-facing causal split:
+    - near cause:
+      - stop / EOS margin is weak on the quantized route
+    - upstream amplifier:
+      - calibration is still over-protecting continuation states relative to short assistant-closing states
+  - a light runtime repetition penalty can suppress some runaway behavior, so the stop margin is at least partially recoverable at decode time
+  - but because `mcq` can worsen and score was not captured, this should remain a diagnostic tool, not the primary fix
+- Quantization implication:
+  - further kernel-path tuning is lower priority than calibration redesign for over-generation
+  - `true160k` should stay an ablation, not the mainline calibration choice
+  - next quant-focused calibration should bias toward:
+    - SOAR task-aligned samples
+    - dominant lengths around `32K-64K`
+    - a small number of `96K-160K` sentinels
+    - explicit assistant-closing / `<|im_end|>` chat-templated endings
+- Environment rule unchanged:
+  - quant env only:
+    - `/root/autodl-tmp/sglang/sglang_submitmatch_uv_py310_gptq_env`
+  - eval env only:
+    - `/root/autodl-tmp/sglang/sglang_submitmatch_uv_py310_eval_env`
+
+2026-04-10 Submission tokenizer asset normalization after GPTQ save
+
+- New official failure moved from quantization to eval startup:
+  - `AttributeError: 'list' object has no attribute 'keys'`
+  - during `LlamaTokenizerFast` init in the eval env
+- Quant-side interpretation:
+  - this is downstream of the GPTQ save/export boundary, not a new Hessian / checkpoint-structure failure
+  - the quantized model weights themselves had already been produced
+- Concrete asset mismatch found on dev output:
+  - quantized output tokenizer assets were incomplete versus the original MiniCPM-SALA model
+  - in particular:
+    - `special_tokens_map.json` was absent
+    - `tokenizer_config.json` was reduced to a minimal fast-tokenizer form
+- Fix promoted into submission:
+  - after a successful GPTQ export, copy the original model's tokenizer assets back into the output dir
+  - files normalized from patched input -> quantized output:
+    - `tokenizer_config.json`
+    - `special_tokens_map.json`
+    - `tokenizer.json`
+    - `tokenizer.model`
+    - `added_tokens.json`
+    - `chat_template.jinja`
+- Added guardrail:
+  - `prepare_model.sh` now uses the eval env itself to run:
+    - `AutoTokenizer.from_pretrained(output, trust_remote_code=True)`
+  - if tokenizer loading is still incompatible, submission now fails early inside `prepare_model.sh`
+  - this should turn a late SGLang startup crash into an earlier, clearer packaging signal
+
+2026-04-10 stopaligned64k promoted to primary submission attempt
+
+- Formal dual-env submission draft now includes:
+  - `calibration_gptq_w4a16_stopaligned64k_v1.jsonl`
+  - matching meta file
+- `prepare_model.sh` attempt order changed to prioritize the current best stop-aligned candidate:
+  1. `stopaligned64k_v1`
+  2. `true160k_fp16_32`
+  3. `pg19_32k_fp16_64`
+- Quantization rationale for this packaging choice:
+  - stop-aligned64k currently has the best downstream local evidence on the py310 dense-fallback eval path
+  - keep the older `true160k` and `pg19_32k` routes only as submission-internal fallback
+- Residual risk explicitly preserved in the docs:
+  - `221` RTN failsafe modules still mean this is a strong candidate, not a fully closed final route
+
+2026-04-10 GPTQ Stop-Aligned64K V1 Quantization And Comparison
+
+- New GPTQ calibration candidate:
+  - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_stopaligned64k_v1.jsonl`
+- Main quantization-side change versus the prior py310 GPTQ baseline:
+  - calibration distribution only
+  - composition:
+    - `36` SOAR public rows
+    - `16` SOAR chat-close rows
+    - `12` PG19 local rows
+  - same serve route later:
+    - dense fallback
+    - no eval edits
+    - no runtime sampling penalty
+- Quantization artifact:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+  - quant log:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_quant.log`
+  - elapsed:
+    - `2723.74s`
+- Important quant-side finding:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1/quant_log.csv` records:
+    - `221` rows with `loss=rtn failsafe`
+  - interpretation:
+    - the stop-aligned calibration direction improved downstream behavior enough to be worth keeping
+    - but this specific `v1` calibration mix is numerically aggressive for GPTQ and broad RTN fallback remains a major risk
+- Tooling fix added to the local quantization workflow:
+  - `/Users/ql/cursor/openbmb/scripts/quantize_gptq_w4a16.py` now copies tokenizer assets from the source model into the output checkpoint after save:
+    - `tokenizer_config.json`
+    - `special_tokens_map.json`
+    - `tokenizer.json`
+    - `tokenizer.model`
+    - `added_tokens.json`
+    - `chat_template.jinja`
+  - purpose:
+    - keep eval-env tokenizer loading compatible without manually repairing each new checkpoint
+- Fast eval result on the repaired checkpoint:
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_fast_retry_20260410_184336`
+  - score:
+    - `58.89%`
+  - previous py310 GPTQ fast baseline:
+    - `46.67%`
+  - delta:
+    - `+12.22`
+- Medium eval result on the same checkpoint:
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_medium_retry_20260410_191105`
+  - outputs:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260410_191120`
+  - score / latency:
+    - `Average Score: 84.40%`
+    - `Total Duration: 1206.01 s`
+    - `Overall TPS (Output): 171.76`
+    - `Total Tokens: In=1494045, Out=207140`
+
+## 2026-04-10 `rtn failsafe` Source-Level Read
+
+- Local source read from bundled wheel:
+  - `/Users/ql/cursor/openbmb/cache/wheels/gptqmodel-5.8.0+cu128torch2.9-cp310-cp310-linux_x86_64.whl`
+- `FailSafeStrategy.RTN` is explicitly:
+  - `round to nearest`
+- `gptqmodel` keeps failsafe enabled by default:
+  - `strategy = RTN`
+  - `threshold = 0.5%`
+- Important nuance:
+  - there are two distinct RTN-fallback paths in GPTQModel
+  - path A:
+    - low-sample proactive failsafe
+    - if a module sees fewer than the thresholded calibration samples, GPTQModel can skip full Hessian-based GPTQ and use the failsafe strategy directly
+  - path B:
+    - numerical-failure fallback
+    - if Hessian Cholesky keeps failing even after damp recovery and diagonal-floor attempts, `hessian_inverse()` returns `None`
+    - quantization then records:
+      - `avg_loss = "rtn failsafe"`
+- Current MiniCPM-SALA runs match path B much more strongly than path A:
+  - logs repeatedly showed:
+    - `Damp recovery failed`
+    - `Applying Hessian diagonal floor`
+    - `Hessian remained non positive-definite after diagonal floor attempts`
+    - then:
+      - `rtn failsafe`
+- Interpretation rule going forward:
+  - a small amount of RTN fallback is not automatically catastrophic
+  - but broad module-level `rtn failsafe` across a dense transformer is a real sign that GPTQ numerics are not healthy under the current calibration mix
+  - for the current stop-aligned v1 checkpoint:
+    - downstream eval improved enough to keep the direction
+    - yet `221` module-level `rtn failsafe` rows still mark the quantization as numerically risky rather than clean
+
+## 2026-04-10 Stop-Aligned + `repetition_penalty=1.03` Follow-Up
+
+- Goal:
+  - test whether a very light decode-side penalty still adds value after the stop-aligned calibration has already reduced over-generation
+- Checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+- Subset:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_medium_overgen8_eval_v1.jsonl`
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_overgen8_rp103_20260410_195537`
+- Serve-side delta only:
+  - `preferred_sampling_params={"repetition_penalty":1.03}`
+- High-signal result from the first `7/8` completed rows:
+  - extraction-style rows still benefited:
+    - `813 -> 808`
+    - `1188 -> 924`
+  - but several `mcq` rows lengthened:
+    - `4747 -> 6210`
+    - `19992 -> 21525`
+    - `18893 -> 19505`
+- Aggregate on those `7` rows versus stop-aligned no-penalty:
+  - baseline output tokens:
+    - `67525`
+  - `rp=1.03` output tokens:
+    - `69475`
+  - delta:
+    - `+1950`
+- Quant/runtime interpretation:
+  - after stop-aligned calibration, the easy stopping gain has already been taken by the quantization side
+  - a blanket `repetition_penalty=1.03` is therefore no longer a clean additive fix
+  - it remains a selective tool for some extraction tails
+  - but it is still not safe enough to promote globally because `mcq` can get longer
+- Previous py310 GPTQ baseline on the same `25`-row half-medium set:
+  - `Average Score: 72.00%`
+  - `Total Duration: 1256.88 s`
+  - `Overall TPS (Output): 262.96`
+  - `Total Tokens: In=1494045, Out=330508`
+- Quantization-side read of that delta:
+  - score:
+    - `+12.40`
+  - duration:
+    - `-50.87s`
+  - output tokens:
+    - `-123368`
+  - output TPS:
+    - lower by about `-91.20`
+  - conclusion:
+    - the gain does not come from a faster kernel path
+    - it comes from fewer total generated tokens on many rows
+    - i.e. stop behavior improved enough to outweigh the slower per-token rate
+- Remaining failure mode after the stop-aligned calibration:
+  - two long-context rows still ran to the evaluation cap:
+    - `input len=63430, output len=65536`
+    - `input len=127738, output len=65536`
+  - several short-prompt `mcq` rows still over-generated into `3k-21k` outputs
+  - therefore:
+    - the stop boundary improved but is still not globally stable
+- Overlap against original stock weights on the same `25` sample indices:
+  - stock outputs:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260409_104905`
+  - current outputs:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260410_191120`
+  - aligned by shared `index`:
+    - `25/25`
+  - task-level aggregate comparison:
+    - `cwe`:
+      - `stock_out=33066`
+      - `cur_out=133449`
+      - `stock_avg=0.80`
+      - `cur_avg=0.82`
+    - `fwe`:
+      - `stock_out=105261`
+      - `cur_out=3692`
+      - `stock_avg=0.40`
+      - `cur_avg=1.00`
+    - `mcq`:
+      - `stock_out=67067`
+      - `cur_out=67697`
+      - `stock_avg=0.40`
+      - `cur_avg=1.00`
+    - `niah`:
+      - `stock_out=76752`
+      - `cur_out=1757`
+      - `stock_avg=0.40`
+      - `cur_avg=1.00`
+    - `qa`:
+      - `stock_out=521`
+      - `cur_out=545`
+      - `stock_avg=0.40`
+      - `cur_avg=0.40`
+- Quantization implication for the next calibration revision:
+  - keep stop-aligned calibration as the main direction
+  - but make `v2` more conservative:
+    - fewer chat-close rows
+    - less aggressive long-tail slice weighting
+    - preserve the gains on `fwe` / `niah`
+    - reduce the new `cwe` and short-`mcq` over-generation tails
+
+## 2026-04-10 Marlin base-weight distribution scan
+
+- Scope for this pass:
+  - only the active `Marlin / GPTQ W4A16` route
+  - excluded `NVFP4`
+  - analyzed exactly the linear weights that the current GPTQ route quantizes:
+    - `self_attn.q_proj`
+    - `self_attn.k_proj`
+    - `self_attn.v_proj`
+    - `self_attn.o_proj`
+    - `mlp.gate_proj`
+    - `mlp.up_proj`
+    - `mlp.down_proj`
+- Why this scope is trustworthy:
+  - current remote GPTQ checkpoints under:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-quantcheck`
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+    - `/root/autodl-tmp/models-gptq-w4a16-sanity16`
+  - all confirm:
+    - `bits=4`
+    - `group_size=128`
+    - `quant_method=gptq`
+  - the `sanity16` config also explicitly excludes:
+    - `self_attn.o_gate`
+    - `self_attn.z_proj`
+  - so this scan is aligned with the real quantized weight set, not a guessed module list
+- Local reusable analyzer added:
+  - `/Users/ql/cursor/openbmb/scripts/analyze_marlin_weight_distribution.py`
+- Remote output artifact:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/marlin_weight_scan/base_marlin_weight_stats.json`
+- Scan method:
+  - streamed the base checkpoint from:
+    - `/root/autodl-tmp/models`
+  - analyzed `224` target tensors total
+  - measured:
+    - absolute tail ratios:
+      - `absmax / p90`
+      - `absmax / p99`
+      - `absmax / p99.9`
+    - kurtosis
+    - fraction above `6 sigma`
+    - `group_size=128` local spike ratios
+- Main read:
+  - the Marlin target weights are not globally broken or NaN-like
+  - but they are not uniformly quantization-friendly either
+  - the risk is concentrated in a few layer families rather than spread evenly across all quantized tensors
+- Most distribution-hostile tensor families on base weights:
+  - `self_attn.o_proj`
+    - median `absmax / p99.9`:
+      - `11.83`
+    - max:
+      - `21.49`
+    - strongest examples:
+      - `model.layers.17.self_attn.o_proj.weight`
+      - `model.layers.9.self_attn.o_proj.weight`
+  - `mlp.down_proj`
+    - median `absmax / p99.9`:
+      - `13.90`
+    - max:
+      - `19.98`
+    - strongest examples:
+      - `model.layers.17.mlp.down_proj.weight`
+      - `model.layers.15.mlp.down_proj.weight`
+      - `model.layers.16.mlp.down_proj.weight`
+  - `self_attn.k_proj`
+    - not the worst on raw `absmax / p99.9`
+    - but it is the heaviest-tailed family statistically:
+      - median kurtosis:
+        - `12.34`
+      - max kurtosis:
+        - `20.46`
+      - median fraction above `6 sigma`:
+        - `4.44e-4`
+- Important nuance for `group_size=128`:
+  - `q_proj` is fairly clean globally:
+    - median `absmax / p99.9`:
+      - `5.62`
+  - but it still shows rare, very sharp local `128`-weight spikes:
+    - max group spike ratio:
+      - `68.74`
+      - on:
+        - `model.layers.8.self_attn.q_proj.weight`
+  - interpretation:
+    - some groups are dominated by a single large weight even when the whole matrix does not look especially heavy-tailed
+    - this is exactly the sort of local pathology that can make `group_size=128` less stable than the global histogram suggests
+- Layer concentration:
+  - worst combined layers in this pass were concentrated around:
+    - `8`
+    - `9`
+    - `15`
+    - `17`
+    - `31`
+  - these layers repeatedly show up in:
+    - largest tail ratios
+    - largest group spike ratios
+    - largest kurtosis
+- Conclusion for route selection:
+  - yes:
+    - part of the current Marlin pain is already present in the base weights
+  - no:
+    - it is not true that all Marlin-target tensors are inherently distribution-bad
+  - strongest suspicion for quantization loss should focus on:
+    - `self_attn.o_proj`
+    - `mlp.down_proj`
+    - selected `self_attn.k_proj`
+    - plus a few rare `q_proj` local groups
+- Best next quant-side action from this evidence:
+  - do not treat the route as uniformly bad
+  - instead test one selective-ablation idea first:
+    - keep Marlin on most layers
+    - but exempt or re-handle the worst `o_proj` / `down_proj` offenders, or at least inspect their post-quant error first
+- Worker status in this pass:
+  - no subagents used
+
+## 2026-04-10 Runtime Penalty Sweep Against `stopaligned64k_v1`
+
+- Purpose:
+  - test whether light serve-side penalties could further stabilize stopping without touching quantization or `eval_model.py`
+- Result:
+  - they did not beat the stop-aligned no-penalty baseline
+- Baseline on the `7` mutable rows:
+  - total output tokens:
+    - `67525`
+  - average score:
+    - `0.9857`
+- `repetition_penalty=1.03`:
+  - mutable `7`-row total output tokens:
+    - `69512`
+  - average score:
+    - `0.8429`
+- `frequency_penalty=0.05`:
+  - matched `rp=1.03` exactly on the tested rows
+  - mutable `7`-row total output tokens:
+    - `69512`
+  - average score:
+    - `0.8429`
+- `presence_penalty=0.05`:
+  - mutable `7`-row total output tokens:
+    - `120462`
+  - average score:
+    - `0.70`
+  - it especially damaged one previously healthy row:
+    - `31433 cwe`
+      - `813 -> 65542`
+- Interpretation for the quantization thread:
+  - stop-aligned calibration already captured the useful stopping gain
+  - blanket runtime penalties mostly trade one tail for another
+  - the remaining fix should come from better quantization behavior, not decode-time penalties
+
+## 2026-04-10 stop-aligned medium rerun sanity check
+
+- Checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+- Dataset:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_medium_eval_v1.jsonl`
+- Rerun result:
+  - `Average Score: 76.40%`
+  - `Total Duration: 1222.97 s`
+  - `Total Tokens: In=1494045, Out=208484`
+  - `Overall TPS (Output): 170.47`
+- Comparison against the earlier logged stop-aligned medium retry:
+  - score:
+    - `84.40% -> 76.40%`
+  - output tokens:
+    - `207140 -> 208484`
+  - duration:
+    - `1206.01 -> 1222.97`
+- Quant-side interpretation:
+  - this does **not** look like a broad return of the old over-generation regime
+  - total output tokens changed only slightly
+  - the drop is concentrated in a few short `mcq` rows that flipped answers
+  - that keeps the focus on selective instability, not a global collapse of the stop-aligned calibration
+
+## 2026-04-11 Selective Marlin Wave 1 tooling landed
+
+- `scripts/quantize_gptq_w4a16.py`
+  - added:
+    - `--dynamic-config-path`
+  - now:
+    - loads JSON `+:regex` / `-:regex` rules
+    - passes them into `QuantizeConfig.dynamic`
+    - records matched modules and effective per-module config into `codex_gptq_manifest.json`
+- `scripts/remote_quant_gptq_py310.sh`
+  - now forwards:
+    - `DYNAMIC_CONFIG_PATH`
+- New quant-side support files:
+  - `configs/selective_marlin/*.json`
+  - `scripts/rank_quant_layer_error.py`
+  - `scripts/launch_selective_marlin_candidate_remote.sh`
+- Interpretation:
+  - we now have a submission-independent way to test selective Marlin ideas on top of the current stop-aligned calibration
+  - this closes the gap between the static bad-layer scan and an actually runnable GPTQ experiment
+
+## 2026-04-11 Candidate A `odown-gs64` quantization
+
+- Route:
+  - stop-aligned calibration unchanged
+  - only selective per-module overrides changed
+- Remote quant artifact:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-gs64`
+- Quant log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selmarlin_odown_gs64_20260411_111629_quant.log`
+- Manifest:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-gs64/codex_gptq_manifest.json`
+- Quant elapsed:
+  - `2686.79 s`
+- Manifest verification:
+  - matched exactly `5` intended modules
+  - all `5` used:
+    - `bits=4`
+    - `group_size=64`
+  - matched modules:
+    - `model.layers.9.self_attn.o_proj`
+    - `model.layers.17.self_attn.o_proj`
+    - `model.layers.15.mlp.down_proj`
+    - `model.layers.16.mlp.down_proj`
+    - `model.layers.17.mlp.down_proj`
+- Quantization read:
+  - route is mechanically valid
+  - tokenizer asset sync still worked
+  - the checkpoint saved cleanly and remained serve-loadable in the eval env
+- Important caveat:
+  - the checkpoint still shows widespread `rtn failsafe` outside the overridden modules
+  - so selective overrides did not magically clean up the whole Hessian-stability picture
+
+## 2026-04-11 Candidate A focused eval verdict
+
+- Focus slice:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_selective_focus10_v1.jsonl`
+- Eval run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selA-odown64-focus_20260411_120315`
+- Output:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260411_120337`
+- Summary:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selA-odown64-focus_20260411_120315/predictions.summary.json`
+- Result:
+  - `avg_score=0.49`
+  - `total_output_tokens=267821`
+- Key failures:
+  - `167 mcq`:
+    - `score=0`
+    - `out=26430`
+  - `344 mcq`:
+    - `score=0`
+    - `out=13658`
+  - `589 mcq`:
+    - `score=0`
+    - `out=24125`
+  - `31433 cwe`:
+    - `score=0.8`
+    - `out=65199`
+  - `63430 cwe`:
+    - `score=0.2`
+    - `out=65545`
+  - `127483 cwe`:
+    - `score=0.1`
+    - `out=65545`
+- Comparison against the latest stop-aligned rerun baseline on the same focus slice:
+  - `avg_score`:
+    - `0.71 -> 0.49`
+  - `total_output_tokens`:
+    - `202859 -> 267821`
+  - worst new regression:
+    - `31433 cwe: 813 -> 65199`
+- Decision:
+  - Candidate A is rejected
+  - selective `gs64` on the two `o_proj` layers was not a safe move in this form
+
+## 2026-04-11 Candidate B `skip-o-down64` launched
+
+- Why B next:
+  - Candidate A suggests `down_proj -> gs64` may still be worth keeping
+  - but `o_proj -> gs64` is too risky
+- Remote quant run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_skip-o-down64_20260411_122530_quant.log`
+- Target output:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down64`
+- Current state at log time:
+  - running in remote `tmux`
+  - window:
+    - `codex-soar:sel-skip-o-down64`
+
+## 2026-04-11 Candidate B `skip-o-down64` quant finished
+
+- Output checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down64`
+- Manifest:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down64/codex_gptq_manifest.json`
+- Quant elapsed:
+  - `2676.66 s`
+- Manifest verification:
+  - matched exactly `5` intended modules
+  - `group_size=64` override:
+    - `model.layers.15.mlp.down_proj`
+    - `model.layers.16.mlp.down_proj`
+    - `model.layers.17.mlp.down_proj`
+  - excluded from quantization:
+    - `model.layers.9.self_attn.o_proj`
+    - `model.layers.17.self_attn.o_proj`
+- Quantization read:
+  - dynamic selective routing worked as designed
+  - save path is submission-compatible in structure
+  - tokenizer asset sync still completed
+  - checkpoint is ready for dense-fallback eval smoke
+- Immediate next step:
+  - run the fixed `focus10` diagnostic set before spending a full `medium` pass
+
+## 2026-04-11 Candidate B `skip-o-down64` focused eval verdict
+
+- Focus slice:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_selective_focus10_v1.jsonl`
+- Eval run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selB-skip-o-down64-focus_20260411_131432`
+- Output:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260411_131454`
+- Summary:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selB-skip-o-down64-focus_20260411_131432/predictions.summary.json`
+- Result:
+  - `avg_score=0.66`
+  - `total_output_tokens=285992`
+- Key reads:
+  - repaired:
+    - `589 mcq: score=1.0, out=15361`
+  - not repaired:
+    - `167 mcq: score=0.0, out=48540`
+    - `344 mcq: score=0.0, out=16106`
+  - healthy short-tail preserved:
+    - `31433 cwe: score=0.8, out=679`
+  - healthy short-tail violated:
+    - `31697 cwe: score=1.0, out=65537`
+  - still pinned long:
+    - `63430 cwe: score=0.8, out=65545`
+    - `127483 cwe: score=0.2, out=65545`
+- Decision:
+  - Candidate B is rejected
+  - it improved one unstable `mcq`, but it still fails the gate because it blew up a previously healthy `cwe` row and underperformed the stop-aligned rerun focus baseline
+
+## 2026-04-11 Candidate C `odown-kq-gs64` launched
+
+- Remote quant run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_odown-kq-gs64_20260411_133633_quant.log`
+- Target output:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-kq-gs64`
+- Why Candidate C next:
+  - Candidate B says `skip-o + down64` alone is insufficient
+  - Candidate C is the next planned selective expansion:
+    - keep `o_proj/down_proj -> gs64`
+    - add suspicious `k_proj`
+    - add the single `q_proj` outlier layer
+
+## 2026-04-11 Candidate C `odown-kq-gs64` quant finished
+
+- Output checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-kq-gs64`
+- Quant elapsed:
+  - `2694.65 s`
+- Dynamic config path:
+  - `/root/autodl-tmp/codex-drafts/configs/selective_marlin/odown-kq-gs64.json`
+- Dynamic pattern matches:
+  - `o_proj -> gs64`:
+    - `model.layers.9.self_attn.o_proj`
+    - `model.layers.17.self_attn.o_proj`
+  - `down_proj -> gs64`:
+    - `model.layers.15.mlp.down_proj`
+    - `model.layers.16.mlp.down_proj`
+    - `model.layers.17.mlp.down_proj`
+  - `k_proj -> gs64`:
+    - `model.layers.8.self_attn.k_proj`
+    - `model.layers.9.self_attn.k_proj`
+    - `model.layers.15.self_attn.k_proj`
+    - `model.layers.17.self_attn.k_proj`
+    - `model.layers.31.self_attn.k_proj`
+  - `q_proj -> gs64`:
+    - `model.layers.8.self_attn.q_proj`
+- Quantization read:
+  - selective pattern matching worked as intended
+  - however the run showed broader Hessian instability than Candidate B, including `rtn failsafe` clusters in:
+    - `layer 7 self_attn.v_proj`
+    - `layer 11 self_attn.o_proj`
+    - `layer 18 mlp.{gate,up,down}_proj`
+    - `layer 27 self_attn.v_proj`
+    - multiple layer-31 attention/MLP modules
+
+## 2026-04-11 Candidate C serve incompatibility
+
+- Focus run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC-odown-kq-gs64-focus_20260411_142403`
+- Failure happened during model load:
+  - `AssertionError: param_data.shape=torch.Size([32, 512]), loaded_weight.shape=torch.Size([64, 512])`
+- Location in remote stack:
+  - `sglang/srt/layers/parameter.py`
+  - `load_qkv_weight`
+- Decision:
+  - Candidate C is rejected before scoring
+  - the `k_proj/q_proj -> gs64` extension is not serve-safe for the current MiniCPM `gptq_marlin` path
+
+## 2026-04-11 Candidate D `skip-o-down` launched
+
+- Remote quant run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_skip-o-down_20260411_142530_quant.log`
+- Target output:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down`
+- Why D next:
+  - Candidate C eliminated the widened `k/q` route on compatibility grounds
+  - Candidate D is the last planned Wave 1 candidate that stays within the serve-safe action set:
+    - exclude the worst `o_proj`
+    - exclude the worst `down_proj`
+
+## 2026-04-11 Candidate D `skip-o-down` quant finished
+
+- Output checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down`
+- Quant log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_skip-o-down_20260411_142530_quant.log`
+- Quant elapsed:
+  - `2552.62 s`
+- End-of-run state:
+  - `saved_quantize_config True`
+  - `done`
+  - `[quantcheck] done 2026-04-11 15:08:21`
+- Immediate read:
+  - this route is materially safer than Candidate C on serving compatibility because it changes no `k/q` packing shape
+  - however the late tail still shows `rtn failsafe` clusters around layer `31` attention and MLP modules, so selective skipping did not remove the deeper Hessian-instability signal by itself
+
+## 2026-04-11 Candidate D `skip-o-down` focused eval verdict
+
+- Focus run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selD-skip-o-down-focus_manual_20260411_151312`
+- Output:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260411_151329`
+- Result:
+  - `avg_score=0.52`
+  - `total_output_tokens=151758`
+- Key reads:
+  - preserved short-tail `cwe` rows:
+    - `31433 cwe: score=0.7, out=543`
+    - `31697 cwe: score=0.9, out=1256`
+    - `63430 cwe: score=0.9, out=709`
+  - did not repair unstable `mcq` rows:
+    - `167 mcq: score=0.0, out=40721`
+    - `589 mcq: score=0.0, out=23504`
+  - newly regressed:
+    - `103 mcq: score=0.0, out=3595`
+- Decision:
+  - Candidate D is rejected
+  - pure skipping of the worst `o/down` modules is safer for `cwe` tails than Candidate B, but not enough to recover `mcq` accuracy
+
+## 2026-04-11 Candidate C2 `odown-qkvall-gs64` launched
+
+- Motivation:
+  - the first Candidate C was asymmetric:
+    - `k_proj` on multiple layers
+    - `q_proj` on only one layer
+    - no matching `v_proj` override
+  - to test the user's hypothesis that the packed MiniCPM QKV path may prefer a *uniform* QKV group size, I launched a revised Candidate C that applies `group_size=64` to `q/k/v` together on the same targeted layers
+- Local config:
+  - `/Users/ql/cursor/openbmb/configs/selective_marlin/odown-qkvall-gs64.json`
+- Remote synced config:
+  - `/root/autodl-tmp/codex-drafts/configs/selective_marlin/odown-qkvall-gs64.json`
+- Remote quant run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_odown-qkvall-gs64_20260411_203927_quant.log`
+- Target output:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64`
+- Dynamic match summary at startup:
+  - `pattern_count=3`
+  - `matched_module_count=20`
+  - `excluded_module_count=0`
+- Current read:
+  - unlike the earlier asymmetric Candidate C, this route has at least entered the GPTQ quantization main loop
+  - it has not yet proven serve compatibility or accuracy; that depends on the checkpoint saving and the next focus gate
+
+## 2026-04-11 Candidate C2 `odown-qkvall-gs64` quant finished
+
+- Output checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64`
+- Quant log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_odown-qkvall-gs64_20260411_203927_quant.log`
+- Quant elapsed:
+  - `2695.21 s`
+- Dynamic confirmation:
+  - the intended symmetric `q/k/v -> gs64` overrides were present in the final manifest
+  - matched modules:
+    - `o_proj`: `2`
+    - `down_proj`: `3`
+    - `q/k/v`: `15`
+- End-of-run read:
+  - checkpoint saved cleanly
+  - however the tail still contains many `rtn failsafe` entries, including dynamic `group_size=64` Q/K/V rows on layer `31`
+
+## 2026-04-11 Candidate C2 focus gate started
+
+- Eval run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC2-odown-qkvall-focus_20260411_213413`
+- Current runtime read:
+  - the server has started successfully under `gptq_marlin`
+  - this is already better than the original asymmetric Candidate C, which failed during MiniCPM QKV weight loading
+  - as of the latest check, the route is in the SGLang server bring-up / weight-load stage, not crashed
+
+## 2026-04-11 Candidate C2 focus gate failed
+
+- Focus run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC2-odown-qkvall-focus_20260411_213413`
+- Result:
+  - no eval score was produced
+  - the route failed during model load before generation
+- Concrete error:
+  - `AssertionError: param_data.shape=torch.Size([32, 512]), loaded_weight.shape=torch.Size([64, 512])`
+  - location:
+    - `sglang/srt/layers/parameter.py`
+    - `load_qkv_weight`
+- Decision:
+  - Candidate C2 is rejected on serving compatibility grounds
+  - symmetric `q/k/v -> gs64` is not enough to satisfy the current MiniCPM packed QKV loader
+
+## 2026-04-11 Candidate C2 RTN count
+
+- Accurate module-level count from:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64/quant_log.csv`
+- Count:
+  - `221 / 224` rows are `rtn failsafe`
+- Note:
+  - whole-log `grep` returned `663`, but that includes repeated warnings and summaries
+  - use `221` as the meaningful checkpoint-level fallback count
+
+## 2026-04-11 MiniCPM fused-QKV dynamic alias hypothesis
+
+- Code-path read:
+  - runtime MiniCPM uses fused `qkv_proj`, not separate `q_proj/k_proj/v_proj`
+  - see:
+    - `submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/models/minicpm.py`
+    - `stacked_params_mapping = [("qkv_proj","q_proj","q"), ("qkv_proj","k_proj","k"), ("qkv_proj","v_proj","v"), ...]`
+  - GPTQ `qzeros/scales` allocation size depends on `quant_config.group_size`
+  - see:
+    - `submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/quantization/gptq.py`
+    - `scales_and_zp_size = input_size_per_partition // group_size`
+  - load-time assertion is here:
+    - `submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/parameter.py`
+    - `load_qkv_weight`
+- Root-cause hypothesis:
+  - checkpoint shard tensors for selected Q/K/V layers are saved with `gs64`-shaped `qzeros/scales`
+  - but runtime dynamic matching likely misses them because the saved `dynamic` rules reference `q_proj/k_proj/v_proj`, while runtime prefix is `qkv_proj`
+  - runtime then allocates fused QKV buffers using global `group_size=128`, which yields `32 x ...` `qzeros/scales`
+  - load fails against checkpoint `64 x ...` tensors
+- Local mitigation landed:
+  - `/Users/ql/cursor/openbmb/scripts/quantize_gptq_w4a16.py` now auto-adds fused `qkv_proj` alias rules for symmetric QKV dynamic patterns such as `(q_proj|k_proj|v_proj)`
+  - intent:
+    - quantization still matches HF module names `q_proj/k_proj/v_proj`
+    - saved metadata also exposes equivalent runtime rules that MiniCPM fused QKV can match
+- Next test:
+  - rerun the symmetric QKV selective candidate with the alias-enabled script before changing SGLang loader code
+
+## 2026-04-11 Alias-only patch was insufficient; fused-QKV runtime fallback fixed loading
+
+- Existing checkpoint metadata patch:
+  - edited:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64/quantize_config.json`
+  - added:
+    - `+:^model\.layers\.(8|9|15|17|31)\.self_attn\.qkv_proj$ -> {"group_size": 64}`
+  - backup:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64/quantize_config.json.bak.codex_qkv_alias`
+- Result:
+  - alias-only patch did **not** fix the load failure
+  - rerun still failed with:
+    - `param_data.shape=torch.Size([32, 512])`
+    - `loaded_weight.shape=torch.Size([64, 512])`
+- Interpretation:
+  - checkpoint metadata naming was part of the story, but not the whole story
+  - fused MiniCPM QKV needed a runtime-side fallback that explicitly reuses shard rules from `q_proj/k_proj/v_proj`
+- Runtime patch applied:
+  - remote:
+    - `/root/autodl-tmp/sglang/python/sglang/srt/layers/quantization/utils.py`
+  - local draft mirror:
+    - `/Users/ql/cursor/openbmb/submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/quantization/utils.py`
+- Runtime patch logic:
+  - keep existing direct dynamic matching unchanged
+  - if a fused `...qkv_proj` layer has no direct match, try sibling `q_proj/k_proj/v_proj`
+  - if at least two matched shard overrides agree, reuse that override for the fused QKV layer
+  - if all matched shard rules are negative, return `False`
+- Result after runtime patch:
+  - `gptq_marlin` server fully loaded the existing symmetric QKV checkpoint
+  - no `load_qkv_weight` assertion
+  - focus10 run entered normal generation
+- Current best read:
+  - the real blocker was fused-QKV runtime dynamic inheritance, not the checkpoint tensors themselves
+
+## 2026-04-11 Selective C packaging target prepared
+
+- New non-draft packaging directory:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-c-qkvall-gs64`
+- Quant-side packaging changes inside that directory:
+  - upgraded `quantize_gptq_w4a16.py` to the dynamic-GPTQ-capable local version
+  - bundled selective config:
+    - `configs/selective_marlin/odown-qkvall-gs64.json`
+  - `prepare_model.sh` now tries:
+    - `selective_c_odown_qkvall_gs64`
+    - before the stop-aligned / 160K / PG19 fallbacks
+- Old draft left on the previous route:
+  - selective `C` runtime patch was removed from:
+    - `submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/quantization/utils.py`
+  - intent:
+    - isolate the selective `C` packaging target cleanly
+
+## 2026-04-12 Selective C official-vs-local verification run
+
+- Official submission result reported by user for selective `C`:
+  - `acc=94.94`
+  - `acc_ori=75.96`
+  - `S1=523.75`
+  - `S8=647.2`
+  - `Smax=1125.8`
+- Matching local full public-set run launched in tmux:
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC2rtfix_full_20260412_012318`
+  - output dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260412_012501`
+- Status at first check:
+  - generation already started and output dir was created successfully
+  - `predictions.jsonl` not written yet
+  - run remained active under the same dense-fallback serve route used in prior local validation
+
+## 2026-04-12 No-attn public-hybrid quant OOM diagnosis
+
+- `49k` retry still OOMed under:
+  - `--offload-to-disk`
+  - `--vram-strategy exclusive`
+  - `--gc-mode on_stage_end`
+- Failure stayed in MiniCPM attention replay:
+  - `modeling_minicpm_sala.py -> chunk_simple_gla -> torch.empty_like(v)`
+  - requested:
+    - `706 MiB`
+  - memory state at OOM:
+    - `90.69 GiB allocated`
+    - `3.21 GiB reserved but unallocated`
+    - `70.12 MiB free`
+- This reinforces:
+  - the blocker is activation-side replay memory, not quantized-weight packing memory
+  - `offload_to_disk` is not a general-purpose live-activation pager
+  - attention-skip on the quant side does not avoid attention forward activations while replaying calibration data
+- Relevant external match found:
+  - GPTQModel discussion `#2174` reports `offload_to_disk=True` being slower and using more VRAM during the second initial forward, and sample-count increases triggering OOM inside attention forward
+- Relevant GPTQModel source read:
+  - `QuantizeConfig.offload_to_disk` is documented as offloading completed module memory during the quant loop
+  - `BaseQModel.quantize(...)` already supports `calibration_concat_size`
+  - `utils/calibration.py` shows `calibration_dataset_concat_size` can chunk long calibration rows into shorter fixed-size pieces
+- Most promising next low-risk lever:
+  - expose `calibration_concat_size` in our wrapper and test `32k`-class chunking before making more aggressive quantization changes
+
+## 2026-04-12 GPTQModel `calibration_concat_size=32768` retry
+
+- Local quant wrapper now exposes:
+  - `--calibration-concat-size`
+- New remote retry launched with:
+  - `--offload-to-disk`
+  - `--vram-strategy exclusive`
+  - `--gc-mode on_stage_end`
+  - `--calibration-concat-size 32768`
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260412_084343_quant.log`
+- Intent:
+  - preserve the current `198`-sample public-hybrid calibration distribution
+  - cap the replay chunk length inside GPTQModel's dataset preparation instead of rebuilding another shorter calibration artifact by hand
+- First live signal:
+  - the run no longer reports `198` replay batches at stage start
+  - it entered cached-input replay with `203` batches, which is consistent with GPTQModel splitting some long rows into additional fixed-size chunks
+- Final outcome:
+  - still OOMed in MiniCPM attention replay at
+    - `chunk_simple_gla -> chunk_fwd_o -> torch.empty_like(v)`
+  - but the failing allocation dropped from the prior `706 MiB` to `512 MiB`
+  - OOM snapshot:
+    - `92.31 GiB allocated`
+    - `1.44 GiB reserved but unallocated`
+    - `230.12 MiB free`
+- Interpretation:
+  - `calibration_concat_size=32768` definitely reduced the live attention activation footprint
+  - it was not enough to clear the current peak on this model / kernel path
+
+## 2026-04-12 GPTQModel `calibration_concat_size=24576` retry
+
+- New run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260412_085737_quant.log`
+- Result:
+  - still OOMed in the same MiniCPM attention replay path
+    - `chunk_simple_gla -> chunk_fwd_o -> torch.empty_like(v)`
+  - failing allocation dropped again:
+    - `384 MiB`
+  - OOM snapshot:
+    - `92.55 GiB allocated`
+    - `1.07 GiB reserved but unallocated`
+    - `362.12 MiB free`
+- Replay batch count increased further:
+  - `271` batches / rows
+- Current pattern:
+  - `~49k` effective replay: `706 MiB` OOM alloc
+  - `32k` concat: `512 MiB`
+  - `24k` concat: `384 MiB`
+- Takeaway:
+  - chunking is working exactly in the expected direction
+  - but the fixed per-stage memory floor remains very high, so we need either a smaller concat size or a lower cached-input footprint
+
+## 2026-04-12 GPTQModel `calibration_concat_size=16384` retry launched
+
+- New run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260412_091154_quant.log`
+- Confirmed args:
+  - `--offload-to-disk --vram-strategy exclusive --gc-mode on_stage_end --calibration-concat-size 16384`
+- Live status at check:
+  - run is active
+  - layer `0` replay is in progress
+  - replay expanded to:
+    - `406` batches / rows
+- Interpretation:
+  - `calibration_concat_size` is definitely chunking the long calibration rows aggressively now
+  - per-row attention peak should continue to fall, while the total replay batch count and staging overhead continue to rise
+- Final outcome:
+  - still OOMed at the same site:
+    - `chunk_simple_gla -> chunk_fwd_o -> torch.empty_like(v)`
+  - failing allocation dropped again:
+    - `256 MiB`
+  - OOM snapshot:
+    - `93.43 GiB allocated`
+    - `451.70 MiB reserved but unallocated`
+    - `108.12 MiB free`
+- Current trend across concat sizes:
+  - `~49k`: `706 MiB`
+  - `32k`: `512 MiB`
+  - `24k`: `384 MiB`
+  - `16k`: `256 MiB`
+- Strong implication:
+  - the dominant burst really is per-row attention live activation size
+  - but a very large fixed floor remains from cached layer inputs / staging state, so shrinking concat size alone is not enough yet
+
+## 2026-04-12 Reduced calibration + CPU layer-output cache retry
+
+- Added a new local calibration compaction helper:
+  - `/Users/ql/cursor/openbmb/scripts/reduce_calibration_by_length.py`
+- Reduction policy used:
+  - keep all rows `<= 32768`
+  - for `> 32768`, keep progressively fewer rows by longer length bands
+  - the concrete remote output for this first pass is:
+    - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_publichybrid_semanticend49k_reduced_v1.jsonl`
+    - `count=115`
+    - `90` official/public rows + `25` open semantic-tail rows
+- Added a second quant-memory lever to:
+  - `/Users/ql/cursor/openbmb/scripts/quantize_gptq_w4a16.py`
+  - new flag:
+    - `--cpu-cache-layer-outputs`
+  - effect:
+    - monkey-patch GPTQModel `LoopProcessor.receive_layer_inputs()` and `receive_input_cache()` so cached replay inputs are moved to CPU instead of being retained on the layer GPU
+- Important note:
+  - no built-in `cache_block_outputs` symbol or exposed config flag was found in the current installed `gptqmodel` package
+  - so the current implementation uses a local compatibility patch rather than flipping a native library knob
+- New active retry:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260412_163700_quant.log`
+  - args:
+    - `--offload-to-disk --vram-strategy exclusive --gc-mode on_stage_end --cpu-cache-layer-outputs`
+  - calibration:
+    - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_publichybrid_semanticend49k_reduced_v1.jsonl`
+- Live evidence that this materially changed the memory regime:
+  - during active replay / layer transition checks:
+    - `2026/04/12 16:39:17, 5%, 17505 MiB / 97887 MiB`
+    - `2026/04/12 16:39:35, 0%, 28307 MiB / 97887 MiB`
+    - `2026/04/12 16:40:12, 93%, 27511 MiB / 97887 MiB`
+  - the run completed `model.layers.0`, finalized the first layer's MLP modules, and advanced into `model.layers.1`
+- Current best read:
+  - previous concat-only attempts shrank the attention burst but left a `50+ GiB` GPU floor from staged replay inputs
+  - moving cached layer outputs to CPU appears to remove that floor, which is why the current run is surviving layer transitions with only ~18-28 GiB on GPU
+  - subsequent live checks showed the run remains healthy deep into the model:
+    - it passed layers `0..24`
+    - latest observed point was `model.layers.25` at forward row `34/115`
+    - GPU memory remained around `33.1 GiB / 97.9 GiB`
+
+## 2026-04-12 Reduced calibration + CPU layer-output cache retry finished
+
+- Completed successfully:
+  - log:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260412_163700_quant.log`
+  - checkpoint:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1`
+  - elapsed:
+    - `2965.38s`
+- Completion markers at the end of the log:
+  - `saved_quantize_config True`
+  - `done`
+  - `[quantcheck] done 2026-04-12 17:26:54`
+- Checkpoint contents look complete:
+  - 3 quantized safetensor shards totaling about `9.1G`
+  - `quant_log.csv`
+  - `quantize_config.json`
+  - `codex_gptq_manifest.json`
+  - copied tokenizer assets:
+    - `tokenizer_config.json`
+    - `special_tokens_map.json`
+    - `tokenizer.json`
+    - `tokenizer.model`
+  - plus `chat_template.jinja`
+- Minimal eval-env smoke passed:
+  - config class:
+    - `MiniCPMSALAConfig`
+  - tokenizer class:
+    - `LlamaTokenizerFast`
+  - stop token decode check:
+    - `73440 -> <|im_end|>`
+- Quant config snapshot:
+  - `bits=4`
+  - `group_size=128`
+  - `desc_act=false`
+  - `sym=true`
+  - dynamic skip rules:
+    - all attention `self_attn.(q_proj|k_proj|v_proj|o_proj)`
+    - `model.layers.(15|16|17).mlp.down_proj`
+- `quant_log.csv` currently shows:
+  - `93` rows marked `rtn failsafe`
+- Operational conclusion:
+  - the combination of reduced long-sequence calibration rows + CPU-cached replay inputs is enough to make this no-attn public-hybrid candidate quantize successfully on 96G
+
+## 2026-04-13 Official submission load failure analysis
+
+- Official submission for the `publichybrid-noattn-skipdown151617` candidate failed at serve load with:
+  - `KeyError: 'model.layers.21.self_attn.qkv_proj.weight'`
+- Diagnosis:
+  - this is not a tokenizer asset issue and does not look like a tar/package corruption issue
+  - it is a fused-QKV naming mismatch in the dynamic skip rules for MiniCPM
+- Why:
+  - the candidate intentionally skipped attention using:
+    - `self_attn.(q_proj|k_proj|v_proj|o_proj)`
+  - but SGLang MiniCPM runtime attention is fused as:
+    - `self_attn.qkv_proj`
+  - MiniCPM loader remaps incoming shard names `q_proj/k_proj/v_proj` -> `qkv_proj`
+  - if fused `qkv_proj` is not also skipped/aliased in the quant config, runtime parameter construction and checkpoint weight loading disagree
+- Local fix applied:
+  - explicit negative dynamic rule added:
+    - `-:^model\\.layers\\.\\d+\\.self_attn\\.qkv_proj$`
+  - `build_minicpm_qkv_runtime_aliases()` expanded so rules ending in:
+    - `(q_proj|k_proj|v_proj|o_proj)$`
+    - or `(?:q_proj|k_proj|v_proj|o_proj)$`
+    also synthesize fused `qkv_proj` aliases
+- Bottom line:
+  - the failed official run points to an incomplete candidate config from our side
+  - packaging thread likely packaged the requested candidate correctly; the candidate definition itself needed the fused-QKV skip fix
+
+## 2026-04-13 Clone-server serve/fast validation after fused-QKV skip patch
+
+- Clone server used:
+  - `rtx6000-1 -> connect.bjb1.seetacloud.com:14968`
+- Existing checkpoint on the clone server:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1`
+- Patched in place on the clone server:
+  - `quantize_config.json`
+  - added:
+    - `-:^model\\.layers\\.\\d+\\.self_attn\\.qkv_proj$`
+- Validation command path:
+  - `/root/autodl-tmp/codex-drafts/remote_fast_eval_gptq_py310.sh`
+- Result dir:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/clone_fast_noattn_qkvskip_20260413_144232`
+- Important serve-side evidence:
+  - no more `KeyError: ... qkv_proj.weight`
+  - server now reaches:
+    - `The server is fired up and ready to roll!`
+  - weight loading completes successfully on the clone server
+- Fast mini-eval finishes successfully:
+  - `avg_score=44.44%`
+  - `pass=3`
+  - `part=2`
+  - `fail=4`
+- Conclusion:
+  - fused-QKV skip patch fixes the startup/serve failure mode
+  - this does not validate the candidate as strong on accuracy, but it does validate that the previous official failure was a naming/config issue rather than packaging corruption
+
+## 2026-04-13 Static RTN / Hessian diagnosis for `publichybrid-noattn-skipdown151617-v1`
+
+- This pass used existing artifacts only:
+  - no fresh eval
+  - no fresh quant
+  - no repo code/config edits beyond logging
+- Artifacts reviewed:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1/quant_log.csv`
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1/quantize_config.json`
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260412_163700_quant.log`
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/marlin_weight_scan/base_marlin_weight_stats.json`
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/clone_fast_noattn_qkvskip_20260413_144232/fast_eval.log`
+
+### RTN concentration
+
+- `quant_log.csv` has exactly `93` rows, and all `93` are `rtn failsafe`.
+- The split is:
+  - `32 x mlp.gate_proj`
+  - `32 x mlp.up_proj`
+  - `29 x mlp.down_proj`
+- Layer coverage:
+  - every layer `0..31` appears
+  - `15/16/17` have only `2` rows each because `mlp.down_proj` was skipped there
+  - all other layers have `3` rows each
+- Practical interpretation:
+  - the current no-attn candidate did not localize instability to a few bad MLPs
+  - every enabled MLP module ended in RTN fallback
+
+### Hessian instability pattern
+
+- The raw quant log shows broad second-order failure, not one isolated layer family:
+  - `651` `Damp recovery failed`
+  - `93` `Applying Hessian diagonal floor`
+  - `93` `Hessian remained non positive-definite`
+  - `279` textual `rtn failsafe` hits in the full log
+- Every enabled MLP module eventually pushed `damp_percent` to `1.00000` and still needed diagonal-floor rescue before falling back.
+- Practical interpretation:
+  - the current run is MLP-wide numerically brittle
+  - `skipdown151617` did not solve the underlying Hessian pathology; it only removed three `down_proj` modules from the line of fire
+
+### Alignment with earlier weight-side sensitivity scan
+
+- `skipdown151617` is not arbitrary.
+- If we rank only `mlp.down_proj` by `absmax_over_p999`, the worst layers are:
+  - `17`
+  - `15`
+  - `16`
+  - `9`
+  - `5`
+- On that narrow tail metric, the current skip set hits the top three `down_proj` layers.
+- But broader aggregate badness is more distributed once we include group spikes:
+  - `mlp.down_proj` top aggregate outliers:
+    - `31`
+    - `12`
+    - `25`
+    - `29`
+    - `11`
+    - `15`
+    - `16`
+    - `9`
+    - `17`
+  - `mlp.gate_proj` top aggregate outliers:
+    - `22`
+    - `28`
+    - `27`
+    - `19`
+    - `8`
+  - `mlp.up_proj` top aggregate outliers:
+    - `31`
+    - `30`
+    - `19`
+    - `8`
+    - `11`
+- Practical interpretation:
+  - `skipdown151617` is directionally reasonable if the goal is to suppress the sharpest `down_proj` tails
+  - but it is too narrow to explain or solve the broader MLP-side instability now visible in the weight scan
+
+### Accuracy attribution from existing results
+
+- Clone fast mini after the fused-QKV skip fix is now a valid quality read because startup is no longer the blocker:
+  - `avg_score=44.44%`
+  - `pass=3`
+  - `part=2`
+  - `fail=4`
+- Failure shape:
+  - `mcq` failed by length cap
+  - both `cwe` rows were partial at length cap
+  - one long `niah` row failed by length cap
+  - one long `qa` row stopped cleanly but was still semantically wrong
+- Stronger references:
+  - bounded fast on `stopaligned64k_v1`:
+    - `58.89%`
+  - historical stronger official route:
+    - `95.78~95.89 acc`
+- The largest changed variable versus the stronger route is calibration:
+  - current no-attn route:
+    - reduced `publichybrid`
+    - prompt-only
+    - no answer-conditioned `chat-close`
+  - stronger stop-aligned route:
+    - explicit answer/stop-aligned calibration rows
+- Current causal ranking:
+  1. calibration drift is the strongest suspect
+  2. the no-attn branch itself is still unproven as an accuracy-positive direction
+  3. `skipdown151617` is a weaker suspect than the first two
+
+### Next-candidate decision table
+
+1. `no-attn + stronger calibration`
+- Calibration:
+  - move back toward stop-aligned / answer-conditioned calibration that still fits with CPU-cached layer outputs
+- Dynamic skip:
+  - keep current no-attn rules
+  - keep `skipdown151617`
+- Quant knobs:
+  - `desc_act=false`
+  - `sym=true`
+  - `damp_percent=0.05`
+- Expected upside:
+  - directly tests the variable with the strongest current evidence against it
+- Main risk:
+  - if no-attn itself is structurally weak, this may still underperform
+
+2. `no-attn-pure-mlp`
+- Calibration:
+  - same stronger calibration as candidate 1
+- Dynamic skip:
+  - keep all-attention skip
+  - remove `skipdown151617`
+- Quant knobs:
+  - `desc_act=false`
+  - `sym=true`
+  - `damp_percent=0.05`
+- Expected upside:
+  - isolates whether `skipdown151617` is helping or over-pruning once calibration is no longer the dominant confounder
+- Main risk:
+  - if the sharpest `down_proj` tails really matter, this may regress further
+
+3. `return to the strong baseline route and spend the first extra accuracy budget on act-order`
+- Use only if both no-attn variants remain weak.
+- Calibration:
+  - return to the stronger baseline route
+- Dynamic skip:
+  - keep selective changes minimal
+- Quant knobs:
+  - first new accuracy-biased sweep should be `desc_act=true`
+  - keep `sym=true`
+  - keep `damp_percent=0.05` until the larger variable mismatch is resolved
+- Practical recommendation:
+  - do not spend more time on attention-side selective edits before trying this simpler accuracy-first fallback
+
+## 2026-04-13 Live calibration-set audit for `publichybrid-noattn-skipdown151617-v1`
+
+- Exact calibration artifact audited:
+  - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_publichybrid_semanticend49k_reduced_v1.jsonl`
+- Builder chain:
+  1. `/Users/ql/cursor/openbmb/scripts/build_gptq_calibration.py`
+  2. `/Users/ql/cursor/openbmb/scripts/reduce_calibration_by_length.py`
+- Real generation path:
+  - full source mix:
+    - `198` rows
+    - `150` `soar_public`
+    - `48` `open_long_semantic_tail`
+  - reduced live mix:
+    - `115` rows
+    - `90` `soar_public`
+    - `25` `open_long_semantic_tail`
+- Exact row-by-row audit exported via:
+  - `/Users/ql/cursor/openbmb/scripts/audit_calibration_dataset.py`
+- Audit outputs:
+  - local:
+    - `/Users/ql/cursor/openbmb/tmp/calibration_audit/current_noattn_publichybrid_reduced_v1.audit.jsonl`
+    - `/Users/ql/cursor/openbmb/tmp/calibration_audit/current_noattn_publichybrid_reduced_v1.audit.csv`
+    - `/Users/ql/cursor/openbmb/tmp/calibration_audit/current_noattn_publichybrid_reduced_v1.summary.json`
+  - remote:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/calibration_audit/current_noattn_publichybrid_reduced_v1.audit.jsonl`
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/calibration_audit/current_noattn_publichybrid_reduced_v1.audit.csv`
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/calibration_audit/current_noattn_publichybrid_reduced_v1.summary.json`
+
+### Audit summary
+
+- token length distribution:
+  - `min=94`
+  - `p50=21553`
+  - `p90=127111`
+  - `p95=133949`
+  - `max=160307`
+  - `mean=36474.9`
+- truncated token length distribution:
+  - `min=94`
+  - `p50=21553`
+  - `p90=49138`
+  - `p95=49150`
+  - `max=49153`
+  - `mean=21954.54`
+- source share:
+  - `soar_public=90 (78.26%)`
+  - `open_long_semantic_tail=25 (21.74%)`
+- task share:
+  - `mcq=30`
+  - `qa=15`
+  - `niah=15`
+  - `fwe=15`
+  - `cwe=15`
+  - `open_text=25`
+- coarse bucket share:
+  - `long_context=70 (60.87%)`
+  - `qa=15 (13.04%)`
+  - `other=30 (26.09%)`
+  - `short_close=0`
+  - `chat=0`
+  - `code=0`
+- termination / close coverage:
+  - `EOS/stop markers = 0 / 115`
+  - `assistant prefixes = 0 / 115`
+  - `system prompt markers = 0 / 115`
+- template composition:
+  - `public_mcq_plain=30`
+  - `public_qa_plain=15`
+  - `public_niah_plain=15`
+  - `public_fwe_plain=15`
+  - `public_cwe_plain=15`
+  - semantic-tail:
+    - `semantic_tail_t0_4-16K=9`
+    - `semantic_tail_t1_4-16K=9`
+    - `semantic_tail_t0_128K-160K=5`
+    - `semantic_tail_t1_128K-160K=2`
+
+### Interpretation
+
+- The live calibration set is fully prompt-only.
+- The most important mismatch is not merely "too many long rows".
+- The strongest mismatch is:
+  - `0%` answer-conditioned closing rows
+  - `0%` assistant-prefix coverage
+  - `0%` explicit stop/EOS coverage
+- Combined with the weak no-attn fast result, this materially strengthens the hypothesis that the current route is underexposed to answer/stop boundary states.
+
+### New mix recommendation from the audit
+
+- Keep public prompts as the backbone.
+- Reduce `open_long_semantic_tail` from `21.7%` toward roughly `10-15%`.
+- Reintroduce explicit answer-conditioned close rows.
+- Target at least `20-30%` close-state / assistant-conditioned coverage instead of `0%`.
+- Preserve long-context pressure, but do not let all supplemental rows be prompt-only semantic-tail prose.
+
+## 2026-04-13 GPTQModel support boundaries for accuracy-biased knobs
+
+- Current saved route:
+  - `bits=4`
+  - `group_size=128`
+  - `sym=true`
+  - `desc_act=false`
+  - `true_sequential=true`
+  - `damp_percent=0.05`
+- Immediate implication:
+  - `true_sequential` is already enabled
+  - `desc_act=true` remains an unused accuracy-biased knob
+  - a `damp_percent` sweep from `0.05` upward toward `0.3` is a valid next experiment family
+- Rotation support in installed `gptqmodel 5.8.0`:
+  - config contains:
+    - `rotation in {hadamard, random}`
+  - implementation exists in:
+    - `gptqmodel/quantization/rotation/rotation.py`
+  - but the base-model gate only supports:
+    - `LlamaQModel`
+    - `Qwen2QModel`
+  - MiniCPM-SALA is not supported by this rotation path
+- Scaling support:
+  - AWQ-specific scaling logic exists in GPTQModel
+  - but that is not a drop-in preprocessing switch for the current GPTQ route
+- SpinQuant support:
+  - conceptually related
+  - not a plug-in toggle for the current MiniCPM GPTQModel flow
+  - would require a separate learned-rotation workflow, not just a small config change
+
+## 2026-04-13 stronger calibration artifact for next no-attn accuracy pass
+
+- Built new calibration JSONL for the planned `no-attn + stronger calibration` run:
+  - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_noattn_strongerclose49k_v1.jsonl`
+- Builder knobs:
+  - `public-quotas = mcq:16,qa:12,niah:12,fwe:12,cwe:12`
+  - `chat-close-quotas = mcq:4,qa:6,niah:6,fwe:4,cwe:4`
+  - `open-quotas = pg19_local:0`
+  - `semantic-tail-quotas = 16K-32K:8,32K-128K:4`
+  - `max_sample_tokens = 49152`
+  - `head_tokens = 4096`
+  - `middle_tokens = 4096`
+  - `tail_tokens = 41056`
+- Builder output:
+  - `records = 100`
+  - `by_source = {'open_long_semantic_tail': 12, 'soar_chat_close': 24, 'soar_public': 64}`
+  - `by_task = {'cwe': 16, 'fwe': 16, 'mcq': 20, 'niah': 18, 'open_text': 12, 'qa': 18}`
+  - `by_bucket = {'0-4K': 20, '16K-32K': 30, '32K-128K': 50}`
+  - `raw_tokens p50/p90/max = 36996 / 127133 / 127667`
+  - `calib_tokens p50/p90/max = 36996 / 49152 / 49152`
+- Full emitted-row audit confirms the intended structural shift:
+  - `source_share = public 64% / chat_close 24% / semantic_tail 12%`
+  - `eos_or_stop_marker coverage = 24%`
+  - `assistant_prefix coverage = 4%`
+  - `short_close bucket = 24%`
+  - `open_long_semantic_tail share` reduced from `21.74%` in the current live no-attn mix to `12%`
+- Important interpretation:
+  - this does not fully replicate runtime chat wrapping
+  - but it does restore explicit answer-conditioned close-state coverage to calibration, which had dropped to `0%` in the current weak no-attn route
+
+## 2026-04-13 live quantization run: strongerclose49k + desc_act + damp=0.10
+
+- Active tmux run on clone server:
+  - `codex-soar:sel-noattn-skipdown151617-gs128`
+- Run id / artifacts:
+  - `selective_noattn-skipdown151617-gs128_20260413_163905`
+  - log:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260413_163905_quant.log`
+  - output:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1`
+- Quant knobs for this live run:
+  - `bits=4`
+  - `group_size=128`
+  - `sym=true`
+  - `true_sequential=true`
+  - `desc_act=true`
+  - `damp_percent=0.10`
+  - `offload_to_disk=true`
+  - `vram_strategy=exclusive`
+  - `gc_mode=on_stage_end`
+  - `cpu_cache_layer_outputs=true`
+- Calibration:
+  - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_noattn_strongerclose49k_v1.jsonl`
+  - `num_samples=100`
+- Startup verification:
+  - quantization reached `[2/3] Running GPTQ quantization...`
+  - calibration totals in log:
+    - `Total non-padded tokens = 3219834`
+    - `100 calibration batches`
+  - layer replay started successfully:
+    - `Forward: Layer=model.layers.0, subset=1/1, batches=100`
+    - observed forward progress past `rows 69/100`
+- Early warning counts at the time monitoring stopped:
+  - `rtn failsafe = 0`
+  - `Damp recovery failed = 0`
+  - `Applying Hessian diagonal floor = 0`
+  - `Hessian remained non positive-definite = 0`
+- Interpretation:
+  - these zero counts are only an early-stage snapshot
+  - the run had not yet reached the later Hessian/packing sections where RTN and damping instability usually surface
+
+## 2026-04-13 failure diagnosis for the `163905` strongerclose run
+
+- Final observed stopping point:
+  - `Quantizing layer 29 of 31`
+  - immediately around:
+    - `Layer 28 Finalize 3/6 tp-pre-pad: model.layers.28.mlp.up_proj`
+    - repeated `Turtle model reloading...`
+- By the time the run died, the log had accumulated:
+  - `rtn failsafe = 84`
+  - `Damp recovery failed = 588`
+  - `Applying Hessian diagonal floor = 84`
+  - `Hessian remained non positive-definite = 84`
+- Negative findings:
+  - no Python traceback
+  - no `CUDA out of memory`
+  - no `[quantcheck] done`
+  - no output checkpoint dir
+  - no cgroup memory OOM evidence:
+    - `memory.events: oom=0, oom_kill=0`
+- Practical interpretation:
+  - this is not behaving like a standard Python-side quantization failure
+  - it also is not behaving like host RAM/disk exhaustion
+  - current best hypothesis is an abrupt native or external termination in the late turtle-reload/finalize phase near layer 28/29
+  - to disambiguate on the next rerun, the wrapper should record the child exit code explicitly and enable crash-oriented diagnostics such as `PYTHONFAULTHANDLER=1`
+
+## 2026-04-13 rerun with improved crash diagnostics
+
+- Upgraded quant wrapper:
+  - `/Users/ql/cursor/openbmb/scripts/remote_quant_gptq_py310.sh`
+- New diagnostics now emitted by the wrapper:
+  - `python_pid`
+  - `python_exit_code`
+  - `python_exit_signal` when applicable
+  - periodic heartbeat with:
+    - GPU memory / utilization
+    - process RSS / VSZ / CPU / MEM / state
+    - cgroup memory counters
+  - final `nvidia-smi` and `memory.events` snapshot on nonzero exit
+  - `PYTHONFAULTHANDLER=1`
+  - `TORCH_SHOW_CPP_STACKTRACES=1`
+  - `python -X faulthandler`
+- Rerun started with the same quant settings:
+  - run id:
+    - `selective_noattn-skipdown151617-gs128_20260413_181114`
+  - log:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/selective_noattn-skipdown151617-gs128_20260413_181114_quant.log`
+  - tmux window:
+    - `codex-soar:sel-noattn-skipdown151617-gs128`
+- Intent:
+  - if the layer-29 failure reproduces, this rerun should distinguish:
+    - Python exception
+    - signal kill
+    - abrupt native termination without Python traceback
+
+## 2026-04-13 result of the monitored rerun `181114`
+
+- The improved wrapper produced the missing discriminator:
+  - `python_exit_code = 137`
+  - `python_exit_signal = 9`
+- Therefore:
+  - the process is being killed with `SIGKILL`
+  - not exiting through a normal Python traceback path
+- Additional evidence from the same log:
+  - `quant_done = no`
+  - no output checkpoint dir was created
+  - final cgroup counters:
+    - `oom = 0`
+    - `oom_kill = 0`
+- So the current evidence now supports:
+  - **external kill / hard termination**
+- and argues against:
+  - Python exception
+  - cgroup memory OOM
+- Final visible region before kill was again the late turtle-reload / finalize path around:
+  - `Quantizing layer 29 of 31`
+  - `Layer 28 Finalize 3/6 tp-pre-pad`
+  - last visible module family in the tail: `model.layers.28.mlp.gate_proj`
+- RTN/Hessian counts at failure remained:
+  - `rtn failsafe = 84`
+  - `Damp recovery failed = 588`
+  - `Applying Hessian diagonal floor = 84`
+  - `Hessian remained non positive-definite = 84`
+- 2026-04-13 19:23 CST: Implemented a hybrid replay-cache path for GPTQ quantization. New local flag: `--gpu-cache-max-gib`. Instead of `--cpu-cache-layer-outputs` moving *all* cached layer outputs to CPU, the shim now greedily keeps as many small replay rows as fit within a fixed GPU budget and spills the rest to CPU. This uses idle VRAM to reduce host RSS while preserving a safety margin for attention replay spikes.
+- 2026-04-13 19:23 CST: Also upgraded `/Users/ql/cursor/openbmb/scripts/remote_quant_gptq_py310.sh` to log cgroup `memory.current` in each heartbeat, because prior failures looked like external `SIGKILL` under container memory pressure rather than Python exceptions or CUDA OOM.
+- 2026-04-13 19:23 CST: Started clone-server tmux run `selective_noattn_skipdown151617_hybrid16g_20260413_194500` with `--gpu-cache-max-gib 16`, stronger calibration, `desc_act=true`, `damp_percent=0.10`, `offload_to_disk`, `exclusive`, and `on_stage_end`. Early memory telemetry is dramatically better than the full-CPU-cache run:
+  - `19:19:53`: GPU `0.84 GiB`, RSS `41.65 GiB`, cgroup current `42.68 GB`
+  - `19:20:53`: GPU `23.55 GiB`, RSS `30.27 GiB`, cgroup current `31.71 GB`
+  - `19:21:53`: GPU `52.99 GiB`, RSS `31.00 GiB`, cgroup current `32.62 GB`
+  - `19:22:54`: GPU `50.71 GiB`, RSS `51.27 GiB`, cgroup current `48.72 GB`
+  The run has already moved past layer 1 and into layer 2 replay, which is a much healthier start than the previous all-CPU-output-cache attempt.
+- 2026-04-13 19:28 CST: Root/system disk pressure was traced to GPTQModel's auto-generated relative offload root: `./gptqmodel_offload/...`, which resolved to `/root/gptqmodel_offload` on the clone server. Before cleanup, `/root/gptqmodel_offload` was `16 GiB`, while the active run only needed the newest directory (`vjjihpmw-yxejlwbe`, ~`874 MiB`). Deleted stale offload trees from older runs; root overlay usage dropped from `81%` to `33%` immediately. Added local support for explicit `--offload-to-disk-path` and wrapper env `OFFLOAD_TO_DISK_PATH` so future runs can send offload data to `/root/autodl-tmp/gptqmodel_offload` instead of the 30G system overlay.

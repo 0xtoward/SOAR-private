@@ -1,0 +1,5 @@
+{
+  "-:^model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)$": {},
+  "-:^model\\.layers\\.\\d+\\.self_attn\\.qkv_proj$": {},
+  "-:^model\\.layers\\.(15|16|17)\\.mlp\\.down_proj$": {}
+}

@@ -1,0 +1,100 @@
+{
+  "count": 100,
+  "token_len_distribution": {
+    "min": 94,
+    "p50": 31744,
+    "p90": 127061,
+    "p95": 127386,
+    "max": 127667,
+    "mean": 53704.42
+  },
+  "truncated_token_len_distribution": {
+    "min": 94,
+    "p50": 31744,
+    "p90": 49152,
+    "p95": 49152,
+    "max": 49152,
+    "mean": 32197.34
+  },
+  "bucket_counts": {
+    "long_context": 48,
+    "other": 16,
+    "qa": 12,
+    "short_close": 24
+  },
+  "bucket_share": {
+    "long_context": 0.48,
+    "other": 0.16,
+    "qa": 0.12,
+    "short_close": 0.24
+  },
+  "source_counts": {
+    "open_long_semantic_tail": 12,
+    "soar_chat_close": 24,
+    "soar_public": 64
+  },
+  "source_share": {
+    "open_long_semantic_tail": 0.12,
+    "soar_chat_close": 0.24,
+    "soar_public": 0.64
+  },
+  "task_counts": {
+    "cwe": 16,
+    "fwe": 16,
+    "mcq": 20,
+    "niah": 18,
+    "open_text": 12,
+    "qa": 18
+  },
+  "task_share": {
+    "cwe": 0.16,
+    "fwe": 0.16,
+    "mcq": 0.2,
+    "niah": 0.18,
+    "open_text": 0.12,
+    "qa": 0.18
+  },
+  "template_counts": {
+    "chat_close_cwe": 4,
+    "chat_close_fwe": 4,
+    "chat_close_mcq": 4,
+    "chat_close_niah": 6,
+    "chat_close_qa": 6,
+    "public_cwe_plain": 12,
+    "public_fwe_plain": 12,
+    "public_mcq_plain": 16,
+    "public_niah_plain": 12,
+    "public_qa_plain": 12,
+    "semantic_tail_t0_16K-32K": 4,
+    "semantic_tail_t0_32K-128K": 2,
+    "semantic_tail_t1_16K-32K": 4,
+    "semantic_tail_t1_32K-128K": 2
+  },
+  "eos_stop_coverage": {
+    "count": 24,
+    "share": 0.24
+  },
+  "assistant_prefix_coverage": {
+    "count": 4,
+    "share": 0.04
+  },
+  "system_prompt_coverage": {
+    "count": 0,
+    "share": 0.0
+  },
+  "long_vs_short_close": {
+    "long_context_count": 48,
+    "short_close_count": 24,
+    "chat_count": 0,
+    "ratio_long_to_short_close": 2.0
+  },
+  "likely_shift_flags": [
+    "low_assistant_prefix_coverage"
+  ],
+  "likely_shift_assessment": "likely_shifted_away_from_answer_conditioned_close_states",
+  "long_context_share": 0.48,
+  "short_close_share": 0.24,
+  "chat_share": 0.0,
+  "stop_marker_coverage_share": 0.24,
+  "assistant_prefix_coverage_share": 0.04
+}

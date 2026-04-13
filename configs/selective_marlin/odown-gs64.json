@@ -1,0 +1,8 @@
+{
+  "+:^model\\.layers\\.(9|17)\\.self_attn\\.o_proj$": {
+    "group_size": 64
+  },
+  "+:^model\\.layers\\.(15|16|17)\\.mlp\\.down_proj$": {
+    "group_size": 64
+  }
+}

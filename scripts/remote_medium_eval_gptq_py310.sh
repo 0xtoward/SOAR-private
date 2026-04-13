@@ -8,6 +8,26 @@ MEDIUM_DATASET="${MEDIUM_DATASET:-${SCRIPT_DIR}/eval_dataset/perf_public_medium_
 RESULT_DIR="${RESULT_DIR:-${SCRIPT_DIR}/test_results/gptq_py310_mediumcheck_$(date +%Y%m%d_%H%M%S)}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30001}"
+PREFERRED_SAMPLING_PARAMS="${PREFERRED_SAMPLING_PARAMS:-}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-}"
+FREQUENCY_PENALTY="${FREQUENCY_PENALTY:-}"
+PRESENCE_PENALTY="${PRESENCE_PENALTY:-}"
+
+if [[ -z "${PREFERRED_SAMPLING_PARAMS}" && ( -n "${REPETITION_PENALTY}" || -n "${FREQUENCY_PENALTY}" || -n "${PRESENCE_PENALTY}" ) ]]; then
+  PREFERRED_SAMPLING_PARAMS="$(
+    python3 - <<PY
+import json
+payload = {}
+if "${REPETITION_PENALTY}":
+    payload["repetition_penalty"] = float("${REPETITION_PENALTY}")
+if "${FREQUENCY_PENALTY}":
+    payload["frequency_penalty"] = float("${FREQUENCY_PENALTY}")
+if "${PRESENCE_PENALTY}":
+    payload["presence_penalty"] = float("${PRESENCE_PENALTY}")
+print(json.dumps(payload, separators=(",", ":")))
+PY
+  )"
+fi
 
 export LD_LIBRARY_PATH="/root/miniconda3/envs/py310/lib:${LD_LIBRARY_PATH:-}"
 export PATH="${ENV}/bin:${PATH}"
@@ -60,26 +80,35 @@ echo "[mediumcheck] start $(date '+%F %T')" | tee "${EVAL_LOG}"
 echo "[mediumcheck] env=${ENV}" | tee -a "${EVAL_LOG}"
 echo "[mediumcheck] model=${MODEL_PATH}" | tee -a "${EVAL_LOG}"
 echo "[mediumcheck] result_dir=${RESULT_DIR}" | tee -a "${EVAL_LOG}"
+echo "[mediumcheck] preferred_sampling_params=${PREFERRED_SAMPLING_PARAMS:-<unset>}" | tee -a "${EVAL_LOG}"
 
 ensure_eval_runtime
 
 pkill -f "sglang.launch_server --host ${HOST} --port ${PORT}" >/dev/null 2>&1 || true
 pkill -f "eval_model.py --api_base http://${HOST}:${PORT}" >/dev/null 2>&1 || true
 
+SERVER_ARGS=(
+  --model-path "${MODEL_PATH}"
+  --quantization gptq_marlin
+  --dtype float16
+  --trust-remote-code
+  --host "${HOST}"
+  --port "${PORT}"
+  --attention-backend flashinfer
+  --force-dense-minicpm
+  --chunked-prefill-size 8192
+  --disable-radix-cache
+  --disable-cuda-graph
+  --skip-server-warmup
+  --enable-request-time-stats-logging
+)
+
+if [[ -n "${PREFERRED_SAMPLING_PARAMS}" ]]; then
+  SERVER_ARGS+=(--preferred-sampling-params "${PREFERRED_SAMPLING_PARAMS}")
+fi
+
 "${ENV}/bin/python" -m sglang.launch_server \
-  --model-path "${MODEL_PATH}" \
-  --quantization gptq_marlin \
-  --dtype float16 \
-  --trust-remote-code \
-  --host "${HOST}" \
-  --port "${PORT}" \
-  --attention-backend flashinfer \
-  --force-dense-minicpm \
-  --chunked-prefill-size 8192 \
-  --disable-radix-cache \
-  --disable-cuda-graph \
-  --skip-server-warmup \
-  --enable-request-time-stats-logging \
+  "${SERVER_ARGS[@]}" \
   > "${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 

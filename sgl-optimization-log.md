@@ -2050,3 +2050,663 @@ LOG_DIR=/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_
 - Important caveat:
   - this is a compatibility-first fallback, not a proof that dense runtime is the final best competition route
   - for now it is the cleanest path to submission environment validation
+
+## 2026-04-10 Over-Generation Runtime Follow-Up On Dense Fallback
+
+- Scope rule for this pass:
+  - left `eval_model.py` unchanged
+  - restricted changes to serve-side experiment plumbing only
+- Verified on the working dense-fallback route:
+  - launch path:
+    - `--attention-backend flashinfer --force-dense-minicpm`
+  - live eval sampling kwargs still were:
+    - `temperature=0.0`
+    - `max_tokens=65536`
+    - `stop=['<|im_end|>', '</s>']`
+  - tokenizer decode confirms those stop strings are correct
+- Runtime conclusion from that verification:
+  - dense fallback does not remove the stopping pathology
+  - so current over-generation is not primarily a sparse-backend bug
+- Fresh tail inspection from the completed dense-fallback medium run showed:
+  - `cwe/fwe` enter low-entropy repeated loops
+  - `mcq` more often spends thousands of tokens on long reasoning before the final answer line
+- Runner improvements for runtime-only A/B:
+  - updated:
+    - `/Users/ql/cursor/openbmb/scripts/remote_medium_eval_gptq_py310.sh`
+    - `/Users/ql/cursor/openbmb/scripts/remote_fast_eval_gptq_py310.sh`
+  - both now support:
+    - `PREFERRED_SAMPLING_PARAMS`
+    - shorthand `REPETITION_PENALTY`
+  - this allows serve-side anti-repeat ablations without changing the eval client
+- Bounded runtime ablation:
+  - focus subset:
+    - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_medium_overgen8_eval_v1.jsonl`
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_overgen8_rp105_20260410_172432`
+  - serve delta only:
+    - `REPETITION_PENALTY=1.05`
+- Why this subset was chosen:
+  - these `8` rows alone accounted for:
+    - `323311 / 330508` output tokens
+    - about `97.82%` of the earlier `25`-row dense-fallback medium output
+- Important caveat:
+  - I stopped the run after the server had emitted request-time stats for all `8` requests, but before the eval client wrote final outputs / score files
+  - therefore this pass only supports token-length conclusions, not accuracy conclusions
+- Server-side request-time stats still gave a high-signal result:
+  - total subset output length fell:
+    - `323311 -> 142756`
+    - about `-55.8%`
+  - strongest reductions:
+    - `input len=127738`:
+      - `65541 -> 688`
+    - `input len=115313`:
+      - `65545 -> 1124`
+    - `input len=31433`:
+      - `65538 -> 43752`
+    - `input len=31697`:
+      - `65544 -> 43752`
+  - `mcq` behavior stayed mixed:
+    - `27922 -> 13694`
+    - `19748 -> 18591`
+    - `6812 -> 5829`
+    - but one case worsened:
+      - `6661 -> 15326`
+- Runtime read:
+  - a light repetition penalty is strong enough to shrink the worst extraction-style loops
+  - but not strong enough to be treated as a safe blanket runtime fix
+  - `mcq` remains the main caution against simply turning this on globally
+- Next runtime recommendation:
+  - keep the dense-fallback path as the clean compatibility route
+  - do not spend the next runtime window on sparse-kernel surgery for this problem
+  - if score attribution on the subset is needed, rerun the same `8` rows and let the client finish writing outputs
+  - otherwise hand the main fix back to the quantization side:
+    - calibration should better preserve short assistant-closing states instead of only long continuation states
+
+## 2026-04-10 Stop-Aligned Calibration Follow-Up On Dense Fallback
+
+- Scope rule for this pass:
+  - left `eval_model.py` unchanged
+  - left dense-fallback serve route unchanged:
+    - `--attention-backend flashinfer --force-dense-minicpm`
+  - changed the quantization calibration distribution instead of the eval client
+- New calibration asset:
+  - `/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_stopaligned64k_v1.jsonl`
+- What changed in the calibration builder:
+  - added a third quota family:
+    - `--chat-close-quotas`
+  - new rows are rendered with the model chat template:
+    - `user -> assistant short answer`
+  - for these rows:
+    - `skip_special_tokens=False`
+    - this preserves closing markers such as `<|im_end|>` in the calibration text
+  - added a sidecar summary file:
+    - `*.meta.json`
+    - records source mix, task mix, and token-length stats
+- Stop-aligned v1 composition:
+  - `64` rows total
+  - source mix:
+    - `soar_public=36`
+    - `soar_chat_close=16`
+    - `pg19_local=12`
+  - task mix:
+    - `mcq=12`
+    - `qa=16`
+    - `niah=16`
+    - `fwe=4`
+    - `cwe=4`
+    - `open_text=12`
+  - length summary:
+    - `calib_tokens p50=63193`
+    - `calib_tokens p90=65536`
+    - `calib_tokens max=65536`
+- New quantized checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+- Quantization note:
+  - `quant_log.csv` shows `221` module-level `rtn failsafe` rows
+  - this is a real quant-side risk marker, but the final evaluation behavior still improved materially
+- Tokenizer startup note:
+  - the checkpoint initially failed eval-env tokenizer load because GPTQ save output did not preserve a compatible tokenizer asset set
+  - copying tokenizer assets from the source model into the output checkpoint unblocked eval-env startup
+  - this was a checkpoint packaging compatibility repair, not the reason for the behavioral score gain
+- Fast eval after tokenizer repair:
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_fast_retry_20260410_184336`
+  - result:
+    - `avg_score=58.89%`
+  - compared with the earlier py310 GPTQ dense-fallback fast baseline:
+    - `46.67% -> 58.89%`
+    - `+12.22`
+  - request-time stats show several rows now stopping at short lengths such as:
+    - `63`
+    - `64`
+    - `128`
+    - `256`
+  - however some `mcq` / `niah` cases still reached `length`
+- Medium eval final completed rerun:
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_medium_retry_20260410_191105`
+  - outputs:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260410_191120`
+  - final result:
+    - `Average Score=84.40%`
+    - `Total Duration=1206.01s`
+    - `Overall TPS (Output)=171.76`
+    - `Total Tokens: In=1494045, Out=207140`
+- Compared with the earlier py310 GPTQ dense-fallback medium baseline on the same `25` rows:
+  - score:
+    - `72.00% -> 84.40%`
+  - duration:
+    - `1256.88s -> 1206.01s`
+  - output tokens:
+    - `330508 -> 207140`
+  - output TPS:
+    - `262.96 -> 171.76`
+- Runtime interpretation:
+  - the win did not come from faster per-token decoding
+  - the win came from generating fewer tokens overall on many rows
+  - dense fallback remains slower per token than desired, but no longer dominates the total wall time once runaway generation is reduced
+- Remaining failure pattern from request-time stats:
+  - two long-context rows still hit `65536`
+  - several short-prompt `mcq` rows still over-generated into the `3k-21k` range
+  - `cwe` remains the clearest residual weakness
+- Direct overlap against the previously saved stock/original-weight outputs on shared `index` values shows:
+  - `fwe` and `niah` improved the most and usually stopped much earlier
+  - `mcq` improved in score but still has unstable output length tails
+  - `qa` stayed roughly flat
+  - `cwe` still has cases where output length explodes even when score is acceptable
+- Current runtime takeaway:
+  - dense fallback is still the valid serve/eval route
+  - sparse-vs-dense is not the main lever for the current gap
+  - stop-aligned calibration is the first change that clearly improved both score and total duration without touching `eval_model.py`
+
+## 2026-04-10 Stop-Aligned + `repetition_penalty=1.03` Runtime Probe
+
+- Scope:
+  - left `eval_model.py` unchanged
+  - kept the same dense-fallback serve route
+  - only changed serve-side default sampling via:
+    - `--preferred-sampling-params {"repetition_penalty":1.03}`
+- Checkpoint under test:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+- Subset under test:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_medium_overgen8_eval_v1.jsonl`
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_overgen8_rp103_20260410_195537`
+- Server confirmed the new default was active:
+  - `preferred_sampling_params={'repetition_penalty': 1.03}`
+- Current read from the completed `7/8` request-time stats:
+  - extraction-style long rows:
+    - `31433 -> 808`
+    - `115313 -> 924`
+    - `31697 -> 1277`
+  - short-prompt `mcq` rows:
+    - `103 -> 6210`
+    - `167 -> 21525`
+    - `344 -> 19226`
+    - `589 -> 19505`
+- Compared with the stop-aligned no-penalty baseline on the same `7` rows:
+  - baseline total output tokens:
+    - `67525`
+  - `rp=1.03` total output tokens:
+    - `69475`
+  - delta:
+    - `+1950`
+- Per-row comparison against the stop-aligned baseline:
+  - `cwe/fwe`:
+    - `813 -> 808`
+    - `1188 -> 924`
+    - `842 -> 1277`
+  - `mcq`:
+    - `4747 -> 6210`
+    - `19992 -> 21525`
+    - `21050 -> 19226`
+    - `18893 -> 19505`
+- Runtime interpretation:
+  - on top of stop-aligned quantization, a light repetition penalty is no longer a clear win
+  - it still helps some extraction tails
+  - but the net effect across the first `7` finished rows is slightly worse because several `mcq` outputs lengthen
+  - this is milder than the earlier `1.05` diagnostic on the older checkpoint, but still not clean enough to promote as a default runtime fix
+- Open state at log time:
+  - the final heaviest row was still running
+  - likely the longest-context `cwe` case
+
+## 2026-04-10 Completed Penalty Sweep On Stop-Aligned Checkpoint
+
+- Checkpoint under test:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1`
+- Baseline for comparison:
+  - stop-aligned no-penalty outputs on the `7` mutable rows
+  - total output tokens:
+    - `67525`
+  - average score:
+    - `0.9857`
+
+### `repetition_penalty=1.03`
+
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/gptq_py310_stopaligned64k_v1_overgen8_rp103_20260410_195537`
+- Full `8`-row subset:
+  - total output tokens:
+    - `135057`
+  - average score:
+    - `0.85`
+- Mutable `7`-row slice:
+  - total output tokens:
+    - `69512`
+  - average score:
+    - `0.8429`
+
+### `frequency_penalty=0.05`
+
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/stopalign_fp005_overgen8_fixed_20260410_201922`
+- Full `8`-row subset:
+  - total output tokens:
+    - `135057`
+  - average score:
+    - `0.85`
+- Key result:
+  - it matched `rp=1.03` exactly on this test slice
+
+### `presence_penalty=0.05`
+
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/stopalign_pp005_overgen7_20260410_203904`
+- Mutable `7`-row subset:
+  - total output tokens:
+    - `120462`
+  - average score:
+    - `0.70`
+- Per-row read:
+  - `103 mcq`:
+    - `4747 -> 5628`
+    - score stayed:
+      - `1`
+  - `167 mcq`:
+    - `19992 -> 16522`
+    - score fell:
+      - `1 -> 0`
+  - `344 mcq`:
+    - `21050 -> 8805`
+    - score stayed:
+      - `1`
+  - `589 mcq`:
+    - `18893 -> 21493`
+    - score fell:
+      - `1 -> 0`
+  - `31433 cwe`:
+    - `813 -> 65542`
+    - score stayed:
+      - `0.9`
+  - `31697 cwe`:
+    - `842 -> 1284`
+    - score stayed:
+      - `1.0`
+  - `115313 fwe`:
+    - `1188 -> 1188`
+    - score stayed:
+      - `1.0`
+
+### Runtime Conclusion
+
+- No tested penalty improved on the stop-aligned no-penalty baseline.
+- Ranking:
+  - best:
+    - no penalty
+  - tied worse:
+    - `repetition_penalty=1.03`
+    - `frequency_penalty=0.05`
+  - worst:
+    - `presence_penalty=0.05`
+- Decision:
+  - do not promote any of these penalties into the default runtime route
+  - do not spend another `fast` eval on penalty tuning for now
+  - return focus to quantization/calibration work
+
+## 2026-04-10 Stop-Aligned Full `medium` Rerun
+
+- Run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/stopaligned64k_v1_medium_full_20260410_210533`
+- Output:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260410_210548`
+- Result:
+  - `Average Score: 76.40%`
+  - `Total Duration: 1222.97 s`
+  - `Total Tokens: In=1494045, Out=208484`
+  - `Overall TPS (Output): 170.47`
+- Compared with the earlier stop-aligned medium retry:
+  - score:
+    - `84.40% -> 76.40%`
+  - output tokens:
+    - `207140 -> 208484`
+  - duration:
+    - `1206.01 -> 1222.97`
+- Per-row drift is concentrated in `mcq`:
+  - `167 mcq`:
+    - `19992 -> 27617`
+    - score:
+      - `1 -> 0`
+  - `589 mcq`:
+    - `18893 -> 22575`
+    - score:
+      - `1 -> 0`
+  - `344 mcq`:
+    - `21050 -> 9667`
+    - score stayed:
+      - `1`
+  - `103 mcq`:
+    - `4747 -> 6466`
+    - score stayed:
+      - `1`
+- Runtime interpretation:
+  - the rerun did not fail because the model suddenly emitted far more total tokens
+  - it failed because a few short `mcq` rows are still unstable enough to flip answers between runs
+  - the stubborn `cwe` tail remains, but it was already present and does not explain most of the new score drop by itself
+
+## 2026-04-11 Selective Marlin focus gate infrastructure
+
+- Added local runtime-side helpers to keep the selective loop reproducible:
+  - `scripts/build_focus_eval_subset.py`
+  - `scripts/summarize_eval_predictions.py`
+  - `scripts/launch_gptq_medium_eval_remote.sh`
+- New remote focused dataset:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_selective_focus10_v1.jsonl`
+- Focus gate definition in practice:
+  - `mcq` prompt tokens:
+    - `103, 167, 202, 344, 589`
+  - `cwe` prompt tokens:
+    - `31433, 31697, 63430, 127483, 127738`
+- Important baseline recovery:
+  - no extra baseline eval was needed
+  - the same focus rows were extracted from the existing stop-aligned `medium` predictions
+  - latest rerun focus baseline:
+    - `avg_score=0.71`
+    - `total_output_tokens=202859`
+
+## 2026-04-11 Candidate A `odown-gs64` focused eval
+
+- Checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-gs64`
+- Eval run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selA-odown64-focus_20260411_120315`
+- Output:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260411_120337`
+- Summary:
+  - `avg_score=0.49`
+  - `total_output_tokens=267821`
+- Key row outcomes:
+  - `103 mcq`:
+    - `score=1`
+    - `out=3362`
+  - `167 mcq`:
+    - `score=0`
+    - `out=26430`
+  - `202 mcq`:
+    - `score=1`
+    - `out=2762`
+  - `344 mcq`:
+    - `score=0`
+    - `out=13658`
+  - `589 mcq`:
+    - `score=0`
+    - `out=24125`
+  - `31433 cwe`:
+    - `score=0.8`
+    - `out=65199`
+  - `31697 cwe`:
+    - `score=1.0`
+    - `out=718`
+  - `63430 cwe`:
+    - `score=0.2`
+    - `out=65545`
+  - `127483 cwe`:
+    - `score=0.1`
+    - `out=65545`
+  - `127738 cwe`:
+    - `score=0.8`
+    - `out=477`
+- Runtime interpretation:
+  - serve compatibility was fine:
+    - dense fallback launched cleanly
+    - stop tokens still propagated as:
+      - `['</s>', '<|im_end|>']`
+  - behavior was not fine:
+    - `167` and `589` remained wrong
+    - `344` regressed from correct to wrong
+    - `31433 cwe` exploded from a short healthy tail to `65199`
+    - two long `cwe` rows still pinned at `65545`
+- Gate decision:
+  - Candidate A fails the focused gate and must not proceed to full `medium`
+
+## 2026-04-11 Runtime next step after Candidate A
+
+- Do not spend more eval time on Candidate A.
+- Candidate B was queued immediately:
+  - quant window:
+    - `codex-soar:sel-skip-o-down64`
+- Why:
+  - Candidate A's biggest new runtime regression came from the route that still quantized the two suspect `o_proj` layers, just with `gs=64`
+  - Candidate B keeps the `down_proj -> gs64` half and removes those `o_proj` layers from quantization entirely
+
+## 2026-04-11 Runtime handoff into Candidate B focus gate
+
+- Quant side delivered a runnable Candidate B checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down64`
+- Remote GPU was idle after quant completion, so runtime work can proceed immediately without queue contention.
+- Gate to run next:
+  - `/root/autodl-tmp/SOAR-Toolkit/eval_dataset/perf_public_selective_focus10_v1.jsonl`
+- Gate rule remains unchanged:
+  - at least one of `167 mcq` or `589 mcq` must recover
+  - `31433 cwe` and `31697 cwe` must stay short-tail and healthy
+- If Candidate B passes:
+  - promote straight to the full `25`-row `medium` eval
+- If Candidate B fails:
+  - move to Candidate C instead of spending more runtime on B
+
+## 2026-04-11 Candidate B focus outcome and runtime decision
+
+- Focus result:
+  - `avg_score=0.66`
+  - `total_output_tokens=285992`
+- Runtime read:
+  - positive:
+    - `31433 cwe` stayed short:
+      - `out=679`
+    - `127738 cwe` also stayed short:
+      - `out=884`
+    - `589 mcq` recovered to:
+      - `score=1.0`
+      - `out=15361`
+  - negative:
+    - `167 mcq` still failed:
+      - `score=0.0`
+      - `out=48540`
+    - `344 mcq` also failed:
+      - `score=0.0`
+      - `out=16106`
+    - `31697 cwe` became a new long-tail failure:
+      - `out=65537`
+- Gate decision:
+  - Candidate B does **not** proceed to full `medium`
+  - the route is not runtime-safe enough because it trades one repaired `mcq` for a newly exploded `cwe`
+
+## 2026-04-11 Runtime handoff into Candidate C
+
+- Quant side delivered a new next candidate by immediately launching:
+  - `Candidate C = odown-kq-gs64`
+- Until that quant finishes, runtime stays idle by design to avoid overlapping heavy jobs.
+- Next runtime action after save:
+  - same `focus10` gate
+  - same pass/fail rule
+
+## 2026-04-11 Candidate C runtime blocker
+
+- Candidate C never reached generation.
+- Server load failed immediately inside the MiniCPM QKV loading path with:
+  - `AssertionError: param_data.shape=torch.Size([32, 512]), loaded_weight.shape=torch.Size([64, 512])`
+- Practical meaning:
+  - this is not a subtle score regression
+  - it is a route-level incompatibility between the widened `k/q -> gs64` selective config and the current SGLang `gptq_marlin` MiniCPM loader
+- Runtime decision:
+  - reject Candidate C without spending any more eval time on it
+  - feed the compatibility failure back into the candidate ordering
+
+## 2026-04-11 Runtime handoff into Candidate D
+
+- Candidate D was launched immediately after Candidate C failed to load.
+- Runtime expectation for D:
+  - it should remain serve-safe because it only excludes modules
+  - if quant saves cleanly, run the same `focus10` gate next
+
+## 2026-04-11 Candidate D runtime gate started
+
+- Quant side delivered a runnable Candidate D checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-skip-o-down`
+- A first scripted launch attempt hit the usual local SSH/DNS flake, but a manual retry succeeded and the runtime gate is now live.
+- Focus run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selD-skip-o-down-focus_manual_20260411_151312`
+- Output dir:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260411_151329`
+- Confirmed runtime state:
+  - server booted cleanly under the same dense fallback path:
+    - `--quantization gptq_marlin`
+    - `--attention-backend flashinfer`
+    - `--force-dense-minicpm`
+  - `eval_model.py` reached generation on the `10`-row focus gate
+  - progress snapshot:
+    - `Generating: 20%|██        | 2/10`
+
+## 2026-04-11 Candidate D focus outcome and runtime decision
+
+- Focus result:
+  - `avg_score=0.52`
+  - `total_output_tokens=151758`
+- Runtime read:
+  - positive:
+    - this route remained serve-safe through the whole run
+    - healthy short-tail `cwe` rows stayed short:
+      - `31433 -> 543`
+      - `31697 -> 1256`
+      - `63430 -> 709`
+  - negative:
+    - both unstable `mcq` rows still failed:
+      - `167 -> score=0.0, out=40721`
+      - `589 -> score=0.0, out=23504`
+    - `103 mcq` also regressed to:
+      - `score=0.0`
+- Gate decision:
+  - Candidate D does **not** proceed to full `medium`
+  - pure skip-on-`o/down` is runtime-safe, but it is not accuracy-safe enough to beat the stop-aligned baseline
+
+## 2026-04-11 Runtime note after Candidate D rejection
+
+- The next quant-side experiment is a revised Candidate C:
+  - `odown-qkvall-gs64`
+- Runtime rationale:
+  - the first Candidate C failed before serving with an asymmetric `k/q` selective config
+  - the revised route makes `q/k/v` uniform on the same targeted layers, which is the smallest useful test of whether the packed MiniCPM QKV path wants symmetric QKV quant settings
+- Runtime remains idle while this new quant is in flight.
+
+## 2026-04-11 Candidate C2 runtime gate
+
+- Quant side delivered a new checkpoint:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64`
+- Focus run launched:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC2-odown-qkvall-focus_20260411_213413`
+- Most important read so far:
+  - this revised symmetric `q/k/v -> gs64` route has not reproduced the old Candidate C load-time QKV shape assertion
+  - it is already past the previous blocker and inside normal SGLang startup / weight loading under:
+    - `--quantization gptq_marlin`
+    - `--attention-backend flashinfer`
+    - `--force-dense-minicpm`
+
+## 2026-04-11 Candidate C2 runtime failure
+
+- Final outcome:
+  - no focus score
+  - server exited during model load
+- Concrete error:
+  - `AssertionError: param_data.shape=torch.Size([32, 512]), loaded_weight.shape=torch.Size([64, 512])`
+- Runtime read:
+  - the symmetric `q/k/v -> gs64` variant got slightly farther into startup than the original Candidate C
+  - but it still fails on the same underlying MiniCPM packed-QKV loader assumption
+- Runtime decision:
+  - reject Candidate C2
+  - do not spend more eval time on QKV `gs64` variants unless we are willing to patch the loader path itself
+
+## 2026-04-11 MiniCPM fused-QKV loader analysis update
+
+- Refined read after tracing model and quant code:
+  - dynamic GPTQ overrides in SGLang are matched against the runtime layer prefix
+  - MiniCPM runtime layer prefix is fused `...self_attn.qkv_proj`, not separate `q_proj/k_proj/v_proj`
+  - therefore a checkpoint whose `dynamic` only names `q_proj/k_proj/v_proj` can still miss the override at runtime even if the saved shard tensors are already `gs64`
+- Why the failure shape is `32 vs 64`:
+  - fused runtime `qkv_proj` likely allocates `qzeros/scales` with global `group_size=128`
+  - selected checkpoint Q/K/V shards carry `gs64` tensor shapes
+  - `load_qkv_weight` compares the narrowed fused target buffer to the loaded checkpoint shard and asserts on mismatch
+- Local mitigation prepared on the quant side:
+  - `/Users/ql/cursor/openbmb/scripts/quantize_gptq_w4a16.py` now synthesizes `qkv_proj` runtime alias rules for symmetric QKV dynamic patterns
+  - this is meant to validate whether the blocker is metadata naming rather than deeper Marlin packing logic
+- Runtime recommendation:
+  - rerun one symmetric QKV selective checkpoint with the alias-enabled quant script before editing SGLang fused-QKV loader internals
+
+## 2026-04-11 Fused-QKV dynamic fallback patch
+
+- Alias-only metadata patch on the existing C2 checkpoint was not enough:
+  - even with explicit `qkv_proj` alias in `quantize_config.json`, the server still failed at:
+    - `load_qkv_weight`
+    - `param_data.shape=[32,512]`
+    - `loaded_weight.shape=[64,512]`
+- Runtime patch applied:
+  - `/root/autodl-tmp/sglang/python/sglang/srt/layers/quantization/utils.py`
+  - local draft mirror:
+    - `/Users/ql/cursor/openbmb/submission-drafts/w4a16-marlin-draft/sglang/python/sglang/srt/layers/quantization/utils.py`
+- Patch behavior:
+  - keep direct dynamic regex matching as-is
+  - add fused-QKV fallback:
+    - when `layer_name.endswith(".qkv_proj")` has no direct match
+    - probe sibling shard names `q_proj/k_proj/v_proj`
+    - if at least two matched shard overrides agree, reuse that override for fused `qkv_proj`
+- Why this is the right level:
+  - it does not depend on guessing the exact runtime alias to inject into checkpoint JSON
+  - it reuses the shard rules that quantization already used
+  - it targets the exact fusion asymmetry unique to MiniCPM runtime
+- Result:
+  - existing checkpoint `/root/autodl-tmp/models-gptq-w4a16-py310-stopaligned64k-v1-odown-qkvall-gs64` now loads successfully under:
+    - `--quantization gptq_marlin`
+    - `--attention-backend flashinfer`
+    - `--force-dense-minicpm`
+  - server reached ready state
+  - focus10 eval started normal generation instead of crashing during model load
+- Current status:
+  - run:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC2rtfix-odown-qkvall-focus_20260411_220634`
+  - last progress seen:
+    - `7/10`
+
+## 2026-04-11 Selective C runtime patch isolated into its own submission folder
+
+- New packaging target:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-c-qkvall-gs64`
+- This folder intentionally keeps the fused-QKV runtime fallback in:
+  - `sglang/python/sglang/srt/layers/quantization/utils.py`
+- Old draft intentionally does not keep that patch anymore:
+  - `submission-drafts/w4a16-marlin-draft/.../utils.py` was reverted
+- Reason:
+  - keep stop-aligned draft and selective `C` draft separate
+  - make packaging handoff unambiguous for the submission thread
+
+## 2026-04-12 Selective C full-run status
+
+- Full public-set check launched in tmux for the runtime-patched selective `C` checkpoint:
+  - tmux:
+    - `codex-soar:eval-selC2rtfix-full`
+  - run dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/selC2rtfix_full_20260412_012318`
+  - output dir:
+    - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260412_012501`
+- Status at first live check:
+  - server ready
+  - generation active on `150` samples
+  - GPU in use
+  - no final `predictions.jsonl` yet, so this check confirms landing rather than final score
