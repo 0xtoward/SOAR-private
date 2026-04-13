@@ -171,6 +171,28 @@ soar_prepare_patched_model_dir() {
   cp -f "${SOAR_PATCHED_MODELING_PY}" "${output_dir}/modeling_minicpm_sala.py"
 }
 
+soar_sync_tokenizer_assets() {
+  local src_dir="$1"
+  local dst_dir="$2"
+
+  [[ -d "${src_dir}" ]] || soar_fail "[common] missing tokenizer source dir: ${src_dir}"
+  [[ -d "${dst_dir}" ]] || soar_fail "[common] missing tokenizer destination dir: ${dst_dir}"
+
+  local name src
+  for name in \
+    tokenizer_config.json \
+    special_tokens_map.json \
+    tokenizer.json \
+    tokenizer.model \
+    added_tokens.json \
+    chat_template.jinja; do
+    src="${src_dir}/${name}"
+    if [[ -f "${src}" ]]; then
+      cp -f "${src}" "${dst_dir}/${name}" || soar_fail "[common] failed to copy tokenizer asset ${name}"
+    fi
+  done
+}
+
 soar_python_has_torch() {
   local py_bin="$1"
   "${py_bin}" - <<'PY' >/dev/null 2>&1

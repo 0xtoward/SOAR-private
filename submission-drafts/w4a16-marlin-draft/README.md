@@ -19,9 +19,10 @@ This draft is now organized as a formal dual-env submission:
   - eval env: `runtime_envs/eval_py310_env`
   - quant env: `runtime_envs/quant_py310_env`
 - Current materialization strategy:
-  1. try bundled `160K` GPTQ calibration first
-  2. if that fails, fall back to bundled `32K PG19` GPTQ calibration
-  3. always quantize on GPU during `prepare_model.sh`
+  1. try bundled `stop-aligned 64K` GPTQ calibration first
+  2. if that fails, fall back to bundled `160K` GPTQ calibration
+  3. if that still fails, fall back to bundled `32K PG19` GPTQ calibration
+  4. always quantize on GPU during `prepare_model.sh`
 
 ## Why this package exists
 
@@ -61,6 +62,11 @@ Interpretation:
 
 ## Bundled Calibration
 
+- `calibration_gptq_w4a16_stopaligned64k_v1.jsonl`
+  - `64` rows
+  - `36` SOAR public rows + `16` SOAR chat-close rows + `12` PG19 local rows
+  - target:
+    - preserve assistant-closing / `<|im_end|>` states without changing eval logic
 - `calibration_gptq_w4a16_true160k_v1.jsonl`
   - `64` rows
   - `48` SOAR public rows + `16` PG19 long-form rows
@@ -85,6 +91,7 @@ Interpretation:
 - `RESULTS.md`
 - `SHA256SUMS.txt`
 - `calibration_gptq_w4a16_true160k_v1.jsonl`
+- `calibration_gptq_w4a16_stopaligned64k_v1.jsonl`
 - `calibration_gptq_w4a16_pg19_v2.jsonl`
 - `wheels/flash_attn-2.8.3+cu128sm120-cp310-cp310-linux_x86_64.whl`
 - `wheels/gptqmodel-5.8.0+cu128torch2.9-cp310-cp310-linux_x86_64.whl`
@@ -103,6 +110,7 @@ Interpretation:
 - The current runtime patch keeps MiniCPM-SALA-specific `o_gate` and `z_proj` unquantized under `gptq` / `gptq_marlin`, which is required for the current local checkpoint to load in SGLang.
 - `prepare_model.sh` now quantizes on the evaluation GPU instead of looking for a prebuilt checkpoint from our own server.
 - Quantization-time model loading still uses the MiniCPM-SALA-specific `transformers 5.5.0` compatibility shims we validated locally, including the FA2 dispatch bridge and tied-weight save shim.
+- The current primary submission candidate is the stop-aligned calibration route because it improved local py310 GPTQ results materially, but it is still a candidate rather than a fully closed final route.
 - `infllm_v2` is bundled in two forms:
   - source tree for rebuild fallback
   - cp310 `.so` when available, so `prepare_model.sh` can try import-first before paying the full compile cost

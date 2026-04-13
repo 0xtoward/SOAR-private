@@ -1,0 +1,195 @@
+{
+  "input_path": "/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_publichybrid_semanticend49k_v1.jsonl",
+  "output_path": "/root/autodl-tmp/SOAR-Toolkit/calibration/calibration_gptq_w4a16_publichybrid_semanticend49k_reduced_v1.jsonl",
+  "seed": 42,
+  "threshold": 32768,
+  "band_size": 8192,
+  "base_keep_ratio": 0.5,
+  "decay": 0.5,
+  "min_keep_ratio": 0.125,
+  "input_summary": {
+    "count": 198,
+    "by_source": {
+      "open_long_semantic_tail": 48,
+      "soar_public": 150
+    },
+    "by_task": {
+      "cwe": 30,
+      "fwe": 30,
+      "mcq": 30,
+      "niah": 30,
+      "open_text": 48,
+      "qa": 30
+    },
+    "by_bucket": {
+      "0-4K": 30,
+      "128K-160K": 30,
+      "16K-32K": 40,
+      "32K-128K": 80,
+      "4K-16K": 18
+    },
+    "by_length_band": {
+      "40961-49152": 110,
+      "<= 32768": 88
+    },
+    "calib_tokens": {
+      "p50": 45056,
+      "p90": 49152,
+      "max": 49152
+    }
+  },
+  "output_summary": {
+    "count": 115,
+    "by_source": {
+      "open_long_semantic_tail": 25,
+      "soar_public": 90
+    },
+    "by_task": {
+      "cwe": 15,
+      "fwe": 15,
+      "mcq": 30,
+      "niah": 15,
+      "open_text": 25,
+      "qa": 15
+    },
+    "by_bucket": {
+      "0-4K": 30,
+      "128K-160K": 7,
+      "16K-32K": 40,
+      "32K-128K": 20,
+      "4K-16K": 18
+    },
+    "by_length_band": {
+      "40961-49152": 27,
+      "<= 32768": 88
+    },
+    "calib_tokens": {
+      "p50": 28968,
+      "p90": 49152,
+      "max": 49152
+    }
+  },
+  "reduction_report": [
+    {
+      "key": [
+        "open_long_semantic_tail",
+        "open_text",
+        "128K-160K",
+        "40961-49152"
+      ],
+      "input_rows": 30,
+      "kept_rows": 7,
+      "keep_ratio_target": 0.25
+    },
+    {
+      "key": [
+        "open_long_semantic_tail",
+        "open_text",
+        "4K-16K",
+        "<= 32768"
+      ],
+      "input_rows": 18,
+      "kept_rows": 18,
+      "keep_ratio_target": 1.0
+    },
+    {
+      "key": [
+        "soar_public",
+        "cwe",
+        "16K-32K",
+        "<= 32768"
+      ],
+      "input_rows": 10,
+      "kept_rows": 10,
+      "keep_ratio_target": 1.0
+    },
+    {
+      "key": [
+        "soar_public",
+        "cwe",
+        "32K-128K",
+        "40961-49152"
+      ],
+      "input_rows": 20,
+      "kept_rows": 5,
+      "keep_ratio_target": 0.25
+    },
+    {
+      "key": [
+        "soar_public",
+        "fwe",
+        "16K-32K",
+        "<= 32768"
+      ],
+      "input_rows": 10,
+      "kept_rows": 10,
+      "keep_ratio_target": 1.0
+    },
+    {
+      "key": [
+        "soar_public",
+        "fwe",
+        "32K-128K",
+        "40961-49152"
+      ],
+      "input_rows": 20,
+      "kept_rows": 5,
+      "keep_ratio_target": 0.25
+    },
+    {
+      "key": [
+        "soar_public",
+        "mcq",
+        "0-4K",
+        "<= 32768"
+      ],
+      "input_rows": 30,
+      "kept_rows": 30,
+      "keep_ratio_target": 1.0
+    },
+    {
+      "key": [
+        "soar_public",
+        "niah",
+        "16K-32K",
+        "<= 32768"
+      ],
+      "input_rows": 10,
+      "kept_rows": 10,
+      "keep_ratio_target": 1.0
+    },
+    {
+      "key": [
+        "soar_public",
+        "niah",
+        "32K-128K",
+        "40961-49152"
+      ],
+      "input_rows": 20,
+      "kept_rows": 5,
+      "keep_ratio_target": 0.25
+    },
+    {
+      "key": [
+        "soar_public",
+        "qa",
+        "16K-32K",
+        "<= 32768"
+      ],
+      "input_rows": 10,
+      "kept_rows": 10,
+      "keep_ratio_target": 1.0
+    },
+    {
+      "key": [
+        "soar_public",
+        "qa",
+        "32K-128K",
+        "40961-49152"
+      ],
+      "input_rows": 20,
+      "kept_rows": 5,
+      "keep_ratio_target": 0.25
+    }
+  ]
+}
