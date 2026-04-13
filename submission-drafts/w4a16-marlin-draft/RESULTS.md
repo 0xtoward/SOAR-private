@@ -35,8 +35,9 @@ At the moment this draft is structured as a formal dual-env submission candidate
     - `self_attn.o_gate`
     - `self_attn.z_proj`
 - Attempt order:
-  1. `true160k_fp16_32`
-  2. `pg19_32k_fp16_64`
+  1. `stopaligned64k_v1`
+  2. `true160k_fp16_32`
+  3. `pg19_32k_fp16_64`
 
 ## Runtime Compatibility
 
@@ -63,6 +64,12 @@ The key submission design decision is now explicit:
 
 ## Bundled Calibration
 
+- Primary calibration candidate:
+  - `calibration_gptq_w4a16_stopaligned64k_v1.jsonl`
+  - `64` rows
+  - `36` SOAR public rows + `16` SOAR chat-close rows + `12` PG19 local rows
+  - intended effect:
+    - preserve assistant-closing / `<|im_end|>` states without changing eval logic
 - Primary calibration:
   - `calibration_gptq_w4a16_true160k_v1.jsonl`
   - `64` rows
@@ -96,11 +103,18 @@ Bounded `fast` on the latest py310 dense fallback `gptq_marlin` eval env:
 - `fail=4`
 - `empty=0/9`
 
+Bounded `fast` on `stopaligned64k_v1` under the same py310 dense fallback eval env:
+
+- `avg_score=58.89%`
+- previous py310 GPTQ baseline:
+  - `46.67%`
+
 Interpretation:
 
 - `gptq_marlin` is materially ahead of stock on the repaired bounded fast gate
 - most failures are still shared between stock and GPTQ
 - the new py310 dense fallback route is usable enough to test evaluation-environment issues without depending on the sparse MiniCPM runtime
+- the stop-aligned calibration candidate improved the bounded fast gate materially over the earlier py310 GPTQ baseline
 
 ## Current Medium Result
 
@@ -120,11 +134,25 @@ Stock base `medium`:
 - `Total Output Tokens: 656170`
 - `TPS: 180.26`
 
+`stopaligned64k_v1` on the current `25`-row half-medium file:
+
+- `Average Score: 84.40%`
+- `Total Duration: 1206.01 s`
+- `Total Output Tokens: 207140`
+- `TPS: 171.76`
+- previous py310 GPTQ baseline on the same file:
+  - `Average Score: 72.00%`
+  - `Total Duration: 1256.88 s`
+  - `Total Output Tokens: 330508`
+  - `TPS: 262.96`
+
 Interpretation:
 
 - this GPTQ route is currently a modest quality win over stock on the validated medium set
 - raw throughput is roughly flat
 - wall-clock is worse because the quantized model over-generates on uncapped `medium`
+- the stop-aligned calibration candidate improved score and reduced total output tokens materially on the current `25`-row medium slice
+- however, it is still not a fully closed final route because quantization remained numerically risky (`221` RTN failsafe modules) and `cwe` is still the clearest remaining over-generation weakness
 
 ## Current Read
 

@@ -161,6 +161,15 @@ run_attempt() {
       --batch-size 1 \
       --max-shard-size 4GB; then
     if [[ -f "${OUTPUT}/quantize_config.json" ]]; then
+      soar_sync_tokenizer_assets "${PATCHED_INPUT_DIR}" "${OUTPUT}"
+      if [[ -x "${SOAR_EVAL_ENV}/bin/python" ]]; then
+        "${SOAR_EVAL_ENV}/bin/python" - <<PY || soar_fail "[prepare_model] eval-env tokenizer validation failed after ${attempt_name}"
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("${OUTPUT}", trust_remote_code=True)
+print("[prepare_model] eval-env tokenizer OK", tok.__class__.__name__)
+PY
+      fi
       echo "[prepare_model] success on ${attempt_name}"
       return 0
     fi
@@ -170,6 +179,12 @@ run_attempt() {
   echo "[prepare_model] failed on ${attempt_name}" >&2
   return 1
 }
+
+run_attempt \
+  "stopaligned64k_v1" \
+  "${SCRIPT_DIR}/calibration_gptq_w4a16_stopaligned64k_v1.jsonl" \
+  "64" \
+  "float16" && exit 0
 
 run_attempt \
   "true160k_fp16_32" \

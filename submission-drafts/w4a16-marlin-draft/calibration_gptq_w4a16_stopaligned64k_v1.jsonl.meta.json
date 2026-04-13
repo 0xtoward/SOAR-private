@@ -1,0 +1,32 @@
+{
+  "count": 64,
+  "by_source": {
+    "pg19_local": 12,
+    "soar_chat_close": 16,
+    "soar_public": 36
+  },
+  "by_task": {
+    "cwe": 4,
+    "fwe": 4,
+    "mcq": 12,
+    "niah": 16,
+    "open_text": 12,
+    "qa": 16
+  },
+  "by_bucket": {
+    "0-4K": 12,
+    "128K-160K": 12,
+    "16K-32K": 14,
+    "32K-128K": 26
+  },
+  "raw_tokens": {
+    "p50": 63193,
+    "p90": 192449,
+    "max": 251604
+  },
+  "calib_tokens": {
+    "p50": 63193,
+    "p90": 65536,
+    "max": 65536
+  }
+}
