@@ -2710,3 +2710,617 @@ LOG_DIR=/root/autodl-tmp/SOAR-Toolkit/test_results/official_stock_base_20260409_
   - generation active on `150` samples
   - GPU in use
   - no final `predictions.jsonl` yet, so this check confirms landing rather than final score
+
+## 2026-04-14 Runtime KV probe on isolated fusion package
+
+- Probe package:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1`
+- Intention:
+  - runtime-only KV exploration on the existing W4A16 weight
+  - no winning-package edits
+  - no fusion broadening
+- New runtime entrypoints:
+  - `run_probe_server.sh`
+    - probe-only launcher
+    - validates probe-local `sglang.launch_server`
+    - writes normalized `launch_context.json`
+  - `run_kv_probe_smoke.sh`
+    - fixed smoke wrapper for:
+      - baseline `flashinfer + auto`
+      - fp8 `flashinfer + fp8_e4m3`
+      - fp4 `triton + fp4_e2m1`
+    - writes per-case `summary.json` with failure-stage and first-token fields
+- Remote probe root:
+  - `/root/autodl-tmp/codex-drafts/w4a16-marlin-fusion-kvcache-probe-v1`
+- Checkpoint used for all three cases:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-hybrid16g-v1`
+- Smoke outcomes:
+  - baseline:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/kv_probe_20260414_014421_baseline`
+    - `success`
+    - first token:
+      - `<think>`
+    - `ttft_ms = 840.485`
+    - `request_latency_ms = 1075.93`
+    - KV dtype line:
+      - `torch.float16`
+  - fp8:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/kv_probe_20260414_014450_fp8`
+    - `success`
+    - first token:
+      - `<think>`
+    - `ttft_ms = 856.822`
+    - `request_latency_ms = 1088.187`
+    - KV dtype line:
+      - `torch.float8_e4m3fn`
+  - fp4:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/kv_probe_20260414_014318_fp4`
+    - `failed`
+    - failure stage:
+      - `server_boot`
+    - precise blocker after `Load weight end`:
+      - `NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'`
+      - site:
+        - `sglang/srt/mem_cache/memory_pool.py`
+- Runtime takeaway:
+  - `flashinfer + auto` and `flashinfer + fp8_e4m3` are both valid same-weight runtime paths in the isolated probe package
+  - the current `triton + fp4_e2m1` route is blocked specifically by FP4 KV buffer initialization, so the next runtime step is a targeted SGLang backend/memory-pool fix rather than more environment work
+
+## 2026-04-14 fp8 fast gate result on the same isolated probe package
+
+- Probe package:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1`
+- Runtime args held fixed at:
+  - `flashinfer + kv_cache_dtype=fp8_e4m3`
+  - `gptq_marlin + float16`
+- Discarded first attempt:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/fp8_fast_eval_20260414_015913`
+  - reason:
+    - it went through official `eval_model.py`
+    - log again showed `max_tokens=65536`
+    - so it reproduced the old uncapped fast-harness bug and is not a valid bounded comparison
+- Valid bounded fast gate:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/fp8_fast_gate_20260414_020423`
+  - harness:
+    - `/root/autodl-tmp/SOAR-Toolkit/.codex_mini_eval_task_caps.sh`
+    - full curated fast file with all rows enabled
+    - task caps:
+      - `mcq=64`
+      - `qa=128`
+      - `niah=128`
+      - `fwe=256`
+      - `cwe=256`
+- Outcome:
+  - `avg_score=32.22%`
+  - `pass=2`
+  - `part=2`
+  - `fail=5`
+  - `empty=0/9`
+- Task pattern:
+  - short `qa` and short `niah` passed
+  - long `qa` / `niah` failed at their `128` caps
+  - both `cwe` rows were partial at `256`
+  - both `fwe` rows failed, including one shorter row that stopped early
+  - `mcq` also failed at `64`
+- Runtime judgement:
+  - fp8 KV remains a good feasibility result
+  - but on the bounded fast gate it does not improve quality and currently lands near stock-base territory rather than the stronger earlier GPTQ fast anchors
+- Next useful comparison if this line continues:
+  - run the exact same bounded fast gate under `kv_cache_dtype=auto` in the same probe package for a clean A/B
+- 2026-04-14 03:37 CST: Native MiniCPM backend probe on `rtx6000-2` advanced materially after a probe-only compat patch. `minicpm_flashinfer` with exact winning checkpoint `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1` no longer dies at fused QKV load. The fix was to force attention modules unquantized when dynamic config marks all attention shards skipped, matching the no-attn checkpoint semantics. Native boot now reaches `Load weight end`, `Using KV cache dtype: torch.float16`, and allocates both mamba and KV memory pools before failing on a new blocker: `ModuleNotFoundError: No module named 'tilelang'` in `sglang/srt/layers/attention/minicpm_fuse_kernel.py`. This narrows the native-backend path blocker from checkpoint structure to missing runtime dependency/kernel path.
+- 2026-04-14 03:55 CST: Installed `tilelang==0.1.8` into the probe eval env on `rtx6000-2` and retried native MiniCPM backends using checkpoint `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-hybrid16g-v1`. Both `minicpm_flashattn` and `minicpm_flashinfer` now boot all the way to `The server is fired up and ready to roll!`, return `GET /v1/models` successfully, and only fail on the first short chat request. The new shared blocker is in `sglang/python/sglang/srt/layers/attention/minicpm_backend.py`, where `update_batch_for_sparse()` computes `seqlen_q_sparse_tensor.max()` on an empty tensor and crashes with `RuntimeError: max(): Expected reduction dim to be specified for input.numel() == 0`. This strongly suggests the remaining native-backend issue is a sparse metadata / empty-prefill edge case, not kernel availability, flashinfer-vs-flashattn choice, or no-attn checkpoint incompatibility.
+- 2026-04-14 10:30-10:46 CST: Continued runtime-side A/B on `rtx6000-2` using the exact winning checkpoint `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1` and the isolated probe package `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1`.
+  - `flash_attn` viability:
+    - our packaged wheel `flash_attn-2.8.3+cu128sm120` still fails to import on this machine with `libstdc++.so.6: version 'CXXABI_1.3.15' not found`
+    - so `flash_attn` is not a practical runtime candidate here without a newer host libstdc++ or a rebuilt wheel/runtime stack
+  - native MiniCPM sparse extension:
+    - rebuilt `/root/autodl-tmp/sglang/3rdparty/sparse_kernel` with `sm_120`
+    - the previous site-packages `.so` only exposed `compute_90/sm_90`
+    - after rebuilding with `nvcc` visible in `PATH`, the new `.so` exposes `compute_120/sm_120`
+    - this removed the earlier `no kernel image is available for execution on the device` blocker for native sparse decode
+  - probe-only runtime patches:
+    - `sglang/python/sglang/srt/mem_cache/common.py`
+      - skip zero-length sparse writes
+    - `sglang/python/sglang/srt/mem_cache/memory_pool.py`
+      - early-return on zero-sized sparse write buffers
+    - `sglang/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`
+      - only pass `forward_batch=` into replay metadata init when the backend signature supports it
+  - exact long-prompt A/B (`prompt_chars=230999`, longest public `cwe`):
+    - exact dense baseline (`flashinfer` + explicit `--force-dense-minicpm`):
+      - `11359.280 ms`
+      - `/tmp/codex_ab3_flashinfer_dense.log`
+    - native `minicpm_flashinfer`:
+      - `18307.803 ms`
+      - `/tmp/codex_ab3_minicpm_flashinfer.log`
+    - conclusion:
+      - native MiniCPM route is now functionally correct on the exact winning checkpoint, but is about `61%` slower on this representative long prompt
+  - exact dense `chunked_prefill_size` sweep on the same prompt:
+    - `4096`: `11862.052 ms`
+    - `8192`: `11320.653 ms`
+    - `16384`: `11637.716 ms`
+    - conclusion:
+      - current winning/default `8192` still looks best
+  - exact dense `triton` after the replay-signature compat patch:
+    - `14516.726 ms`
+    - `/tmp/triton_dense_exact_patch.log`
+    - conclusion:
+      - `triton` is no longer crashing, but is about `28%` slower than exact dense `flashinfer` on the same long prompt
+  - overall runtime takeaway:
+    - for the current winning checkpoint, the exact dense `flashinfer` route still dominates the native MiniCPM path and the current `triton` dense path on representative long prompts
+    - near-term runtime wins are unlikely to come from native sparse backend or generic `triton` unless a deeper backend change lands
+- 2026-04-14 10:57-11:15 CST: Tightened the runtime A/B so it really matches the winning serve flags instead of the lighter probe defaults.
+  - exact strict dense vs native (`--disable-radix-cache --chunked-prefill-size 8192 --skip-server-warmup --disable-cuda-graph --quantization gptq_marlin --dtype float16`, same longest public `cwe` prompt):
+    - `flashinfer_dense_exactfull`:
+      - `11900.422 ms`
+      - `/tmp/flashinfer_dense_exactfull.log`
+    - `minicpm_flashinfer_exactfull`:
+      - `18535.713 ms`
+      - `/tmp/minicpm_flashinfer_exactfull.log`
+    - conclusion:
+      - native MiniCPM stays slower even under exact winning flags, by roughly `56%`
+  - probe env cleanup:
+    - found a broken local `torch 2.11` in the probe eval env shadowing the inherited official `torch 2.9.1+cu128`
+    - child processes then failed with `libtorch_global_deps.so` missing
+    - removed the local `torch/torchgen` tree so the probe env again resolves torch through `soar_official_base_env.pth`
+  - strict exact `triton` after env cleanup:
+    - `triton_dense_exactfull`:
+      - `48600.792 ms`
+      - `/tmp/triton_dense_exactfull.log`
+    - conclusion:
+      - with the real winning serve flags, `triton` is over `4x` slower than exact dense `flashinfer`
+  - strict CUDA graph knob on exact dense `flashinfer`:
+    - `flashinfer_dense_cudagraph_on` (omit `--disable-cuda-graph`):
+      - `42482.739 ms`
+      - `/tmp/flashinfer_dense_cudagraph_on.log`
+    - `flashinfer_dense_cudagraph_off`:
+      - `12064.137 ms`
+      - `/tmp/flashinfer_dense_cudagraph_off.log`
+    - conclusion:
+      - for the current winning checkpoint and long-prompt workload, keeping `--disable-cuda-graph` is strongly preferred; enabling CUDA graph is dramatically slower
+- 2026-04-14 12:02-12:04 CST: Measured a true fusion delta instead of another backend/flag no-op. In the probe `sglang` tree, added an env-gated switch in `sglang/python/sglang/srt/models/minicpm.py` so `SGLANG_DISABLE_MINICPM_ADD_RMSNORM_FUSION=1` forces the MiniCPM decoder block to split `residual add` and `RMSNorm` instead of using the current fused `self.input_layernorm(hidden_states, residual)` / `self.post_attention_layernorm(hidden_states, residual)` path. With the exact winning checkpoint, exact winning serve flags, and the longest public `cwe` prompt (`230999` chars):
+  - fused baseline:
+    - result dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/fusion_add_rmsnorm_20260414_120234/baseline_fused`
+    - `ttft_ms = 11583.803`
+    - `request_latency_ms = 11703.271`
+  - unfused add+rmsnorm:
+    - result dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/fusion_add_rmsnorm_20260414_120234/unfused_add_rmsnorm`
+    - `ttft_ms = 11668.396`
+    - `request_latency_ms = 11798.423`
+  - conclusion:
+    - fused add+RMSNorm is real and already active on the winning runtime path
+    - removing it only hurts by about `0.7%` on TTFT and `0.8%` on total request latency on this representative long prompt
+    - so this Week 2 / Week 4 fusion point is already basically exhausted and is not the missing `48.2 -> 50+` lever by itself
+- 2026-04-14 12:11-12:14 CST: Measured the fused `SiluAndMul` (SwiGLU) MLP path on the same exact-winning route. In `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1/sglang/python/sglang/srt/models/minicpm.py`, added an env-gated switch so `SGLANG_DISABLE_MINICPM_SILU_AND_MUL_FUSION=1` replaces `self.act_fn(gate_up)` with native `F.silu(gate_up[..., :d]) * gate_up[..., d:]`. Same exact winning checkpoint, same exact winning serve flags, same longest public `cwe` prompt (`230999` chars):
+  - fused baseline:
+    - result dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/fusion_silu_and_mul_20260414_121125/baseline_fused`
+    - `ttft_ms = 11539.797`
+    - `request_latency_ms = 12075.750`
+  - unfused silu+mul:
+    - result dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/fusion_silu_and_mul_20260414_121125/unfused_silu_and_mul`
+    - `ttft_ms = 11630.933`
+    - `request_latency_ms = 12164.006`
+  - conclusion:
+    - fused `SiluAndMul` is also already active and correct on the winning runtime path
+    - removing it hurts by only about `0.8%` on TTFT and about `0.7%` on total request latency
+    - so the obvious MLP fusion point is also already basically exhausted
+- 2026-04-14 12:27-12:30 CST: Tested the native MiniCPM hint `--dense-as-sparse` on `rtx6000-2` using the exact winning checkpoint, native `minicpm_flashinfer`, and the same longest public `cwe` prompt. Result dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/dense_as_sparse_20260414_122833`
+  - native default:
+    - `ttft_ms = 18591.756`
+    - `request_latency_ms = 19352.760`
+  - native + `--dense-as-sparse`:
+    - `ttft_ms = 18318.924`
+    - `request_latency_ms = 19071.291`
+  - conclusion:
+    - forcing short/native batches down the sparse path gives a small native-only win (~`1.5%`)
+    - but it does not close the much larger gap to exact winning dense `flashinfer`
+- 2026-04-14 16:20-16:45 CST: Closed the gap between the disappointing local FP8-KV bench story and the new official evaluation result for the exact-winning sibling package with `full fp8 KV`.
+  - New official result reported by the user for `submission-w4a16-marlin-publichybrid-noattn-skipdown151617-fp8full-v1`:
+    - `acc = 99.14`
+    - `acc_ori = 79.31`
+    - `final_score = 48.8`
+    - `benchmark_duration = {S1: 571.16, S8: 695.67, Smax: 1160.96}`
+  - Interpretation:
+    - the runtime-only `--kv-cache-dtype fp8_e4m3` sibling is real and slightly faster on the official machine
+    - the earlier local negative result should therefore be treated as a bench-mismatch warning, not as proof that full-FP8 KV is useless
+  - Root-cause analysis of the local mismatch:
+    - `proxy11` was always a quick relative A/B proxy, not an official-like speed harness
+    - more importantly, `perf_public_set.jsonl` lacks `model_response`, while official `bench_serving.sh` derives decode length from the assistant text inside the speed JSONL
+    - therefore any local speed bench that reused raw public eval rows without synthesizing assistant text length was suppressing decode pressure and could miss KV-cache wins
+  - Harness fix implemented:
+    - `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py` now has a new `public-speed` profile
+    - it generates `/root/autodl-tmp/SOAR-Toolkit/bench_speed_public_full.jsonl` from `perf_public_set.jsonl`
+    - it uses the target model tokenizer to synthesize deterministic assistant text whose token length matches each row’s public `completion_tokens`
+    - it also reorders rows in a stable round-robin over `mcq / qa / niah / fwe / cwe` after sorting each task by prompt length, so `S8/Smax` are no longer accidentally front-loaded by one task family
+    - optional `--public-speed-completion-cap` was added for bounded debug runs
+  - Updated guidance:
+    - use `proxy11` only for cheap relative smoke/triage
+    - use `public-speed` for submission-facing runtime A/B, especially for KV-cache or scheduler experiments
+- 2026-04-14 17:00-18:55 CST: Tightened the new `public-speed` harness after actually trying to run it on the exact winning route.
+  - Exact-winning runtime launch path:
+    - `flashinfer + force-dense-minicpm + gptq_marlin + float16 + disable-radix-cache + disable-cuda-graph`
+    - server must be launched from the probe/editable env, not the stock shared env, otherwise the fused-QKV checkpoint fails to load with:
+      - `KeyError: 'model.layers.0.self_attn.qkv_proj.weight'`
+  - Runner upgrade:
+    - `/Users/ql/cursor/openbmb/scripts/run_remote_candidate_bench.py` now honors:
+      - `SOAR_REMOTE_HOST`
+      - `SOAR_REMOTE_SOAR_ROOT`
+      - `SOAR_REMOTE_SGLANG_ROOT`
+      - `SOAR_REMOTE_PYTHON`
+      - `SOAR_REMOTE_ENV`
+    - this makes the speed harness usable with isolated probe/submission envs instead of only the shared stock env
+  - First public-speed reality check:
+    - using all 150 public rows with raw public `completion_tokens` generated:
+      - `prompt_tokens_total = 8,644,166`
+      - `completion_tokens_bench_actual_total = 246,942`
+    - on the exact-winning route, that immediately looked wrong for an official-like speed proxy:
+      - `S1` decode sat around `~60 tok/s`
+      - uncapped `S1` would therefore drift toward hour-scale runtime
+    - conclusion:
+      - direct reuse of raw public `completion_tokens` overweights decode and is not a faithful hidden-speed proxy
+  - Second harness upgrade:
+    - added `--public-speed-per-task-bucket`
+    - the public-speed generator can now stably subsample one or more rows per `(task, prompt-bucket)` instead of always keeping all public rows
+    - together with `--public-speed-completion-cap 128`, this yields a much smaller public-derived speed proxy:
+      - `completion_tokens_bench_actual_total = 18,424`
+      - much closer to the official `S1≈571s` scale than the uncapped 246k-output version
+  - Operational blocker:
+    - repeated SSH transport resets (`kex_exchange_identification: read: Connection reset by peer`) hit both `rtx6000-2` and `rtx6000-1`
+    - so the final bounded public-proxy A/B (`fp16` vs `full fp8`) did not complete in this pass
+  - Current recommendation:
+    - for the next stable window, run:
+      - exact winning route
+      - `--profile public-speed`
+      - `--public-speed-completion-cap 128`
+      - `--public-speed-per-task-bucket 1`
+      - server launched with probe-env `SOAR_REMOTE_PYTHON`
+- 2026-04-14 19:01-19:04 CST: Ran the requested quick “most explosive” local check on `rtx6000-2` after the public-speed harness fixes.
+  - Setup:
+    - exact winning runtime route
+    - server launched from the probe editable env
+    - `Smax` only
+    - public-derived proxy with:
+      - `--public-speed-completion-cap 128`
+      - `--public-speed-per-task-bucket 1`
+    - resulting speed set metadata:
+      - `count = 9`
+      - `prompt_tokens_total = 608,903`
+      - `completion_tokens_bench_actual_total = 1,115`
+  - Results:
+    - `fp16_auto`
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260414_190147_fp16_auto_publicspeed_smax_quick`
+      - `Smax = 51.04s`
+    - `fp8_full`
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/candidate_benches/20260414_190339_fp8_full_publicspeed_smax_quick`
+      - `Smax = 51.95s`
+  - Interpretation:
+    - this quick local `Smax` probe still does **not** reproduce the official `fp8_full` win
+    - local delta is small but negative for FP8 (`+0.91s`, about `+1.8%`)
+    - so the mismatch remains real:
+      - official machine + hidden speed set favors `fp8_full`
+      - our current public-derived local proxy still slightly disfavors it
+- 2026-04-14 19:09-19:23 CST: Verified the stronger KV-pressure condition requested by the user using the probe-local `kv_pressure_smax` path on `rtx6000-2`.
+  - This route is distinct from `bench_serving.sh`: it polls live `/get_load` and is meant to answer “did we really push live KV/token load past the intended threshold?”
+  - FP16 exact-winning route:
+    - `flashinfer + force-dense-minicpm + gptq_marlin + float16 + disable-radix-cache + disable-cuda-graph`
+    - parsed `max_total_num_tokens = 6,301,509`
+  - First attempt:
+    - `oversubscribe_ratio = 2.1`
+    - `min_prompt_tokens = 100000`
+    - `output_cap = 64`
+    - observed live `/get_load` plateau only around `~12.50M` tokens, about `1.98x` the FP16 capacity reference
+    - diagnosis: the active request mix still included enough `112K / 119K` prompts that the live average prompt size was slightly too low
+  - Tightened attempt:
+    - `oversubscribe_ratio = 2.1`
+    - `min_prompt_tokens = 127500`
+    - `output_cap = 64`
+    - observed live `/get_load` on the FP16 route:
+      - `num_tokens = 12,757,786`
+      - ratio vs FP16 capacity reference: `2.02456x`
+    - so this pass really did exceed `2x` the FP16 KV capacity line
+  - FP8 cross-check with the same FP16-based target:
+    - `fp8 max_total_num_tokens = 12,603,019`
+    - launched with `--capacity-ref-tokens 6301509` so the workload target remained tied to the FP16 reference
+    - observed live `/get_load`:
+      - `num_tokens = 12,753,083`
+      - ratio vs FP16 reference: `2.02381x`
+      - ratio vs FP8 server capacity itself: about `1.0119x`
+  - Updated lesson:
+    - to truly push beyond `2x` the FP16 capacity reference, raising `oversubscribe_ratio` alone was not enough
+    - the workload also had to be restricted to the very top `127.5K+` prompt band so the live active set stayed dense enough
+- 2026-04-14 19:54-20:26 CST: Corrected the interpretation of the earlier KV-pressure metric and finished a stronger synthetic serving A/B on `rtx6000-2`.
+  - Source-level correction:
+    - `Scheduler.get_load()` adds waiting-queue `req.seqlen` values to the current token count.
+    - therefore the earlier `>2x fp16 capacity` result was a **queued live-load** observation, not a proof that resident KV occupancy itself exceeded `2x`.
+  - `bench_one_batch` attempt:
+    - exact winning route with `flashinfer`, `160k input`, `256 output`, `batch=39` on FP16
+    - failed at FlashInfer prefill-planner workspace allocation before any real KV capwall comparison
+    - bumping `SGLANG_FLASHINFER_WORKSPACE_SIZE` to `2GB` did not remove that planner overflow
+  - Switched to a harsher server-style synthetic benchmark:
+    - `bench_serving --backend sglang --dataset-name random-ids --num-prompts 256 --random-input-len 32768 --random-output-len 2048 --random-range-ratio 0 --max-concurrency 256 --disable-tqdm`
+    - kept the exact winning server route except for `kv_cache_dtype`
+    - uncovered one more harness nuance:
+      - without `--tokenize-prompt`, the `random-ids` path decodes ids back to text before sending them to the server
+      - this means the actual server-side prompt lengths were lower than the nominal `32K / 2K`
+      - the FP16 vs FP8 comparison is still fair, but the next stricter rerun should add `--tokenize-prompt`
+  - FP16 result:
+    - dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/smax_synth32k2kfix_20260414_200911_fp16`
+    - duration `384.0669s`
+    - total throughput `10835.05 tok/s`
+    - peak log state:
+      - full token usage `0.68`
+      - mamba usage `0.50`
+      - running req `255`
+      - queue req `229`
+  - Full-FP8 result:
+    - dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/smax_synth32k2kfix_20260414_202010_fp8full`
+    - duration `373.5966s`
+    - total throughput `11138.71 tok/s`
+    - peak log state:
+      - full token usage `0.34`
+      - mamba usage `0.50`
+      - running req `255`
+      - queue req `238`
+  - Interpretation:
+    - `full fp8 KV` did win under this stronger synthetic serving load:
+      - duration improved by `10.47s` (`-2.73%`)
+      - total throughput improved by `+2.80%`
+    - the hybrid bottleneck split is now much clearer:
+      - FP8 relieves the **full-attention KV** side substantially
+      - but it does **not** relieve the **mamba/lightning-state** side
+    - this is a plausible reason the local gain often looked smaller/noisier than the official machine even though the official submission still improved.
+- 2026-04-15 21:30-21:35 CST: `fp4_e2m1` KV cache resumed on `rtx6000-2` with the plain `99+` winning checkpoint.
+  - Reproduced the old failure exactly:
+    - hybrid MiniCPM used `HybridLinearKVPool -> MHATokenToKVPool`
+    - that path allocates `torch.zeros(..., dtype=torch.float4_e2m1fn_x2)` and fails at boot with:
+      - `NotImplementedError: "fill_cuda" not implemented for 'Float4_e2m1fn_x2'`
+  - Minimal runtime patch in the isolated probe tree:
+    - `HybridLinearKVPool` now routes FP4-dtype hybrid models to the existing `MHATokenToKVPoolFP4 / MLATokenToKVPoolFP4` implementations
+  - New behavior after the patch:
+    - default/uncapped FP4 boot succeeds
+    - but first decode still OOMs because `get_key_buffer/get_value_buffer` dequantize the entire FP4 pool into `bf16`
+  - Important working smoke runs:
+    - `max_total_tokens=4194304`:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/fp4_caprun_20260415_213351`
+      - HTTP 200 short decode succeeded
+    - `max_total_tokens=8388608`:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/fp4_caprun8m_20260415_213454`
+      - HTTP 200 short decode also succeeded
+  - Bottom line:
+    - FP4 KV is now startup-feasible on the hybrid route
+    - the remaining blocker is not init anymore; it is the whole-buffer dequant path in the Triton full-attention backend
+- 2026-04-15 22:04-22:05 CST: isolated `SimpleGLAAttnBackend` on idle `rtx6000-1`.
+  - Backend identity:
+    - this MiniCPM lightning path is Triton-backed, not flashinfer and not a standalone custom CUDA kernel path
+    - `SimpleGLAAttnBackend` calls `fused_recurrent_simple_gla` or `chunk_simple_gla`
+    - the vendored `fla.ops.simple_gla.parallel`, `fla.ops.simple_gla.chunk`, and `fla.ops.common.fused_recurrent` are Triton implementations
+  - MiniCPM-like microbench (`H=32`, `K=128`, `V=128`, `float16`):
+    - recurrent `B=32,T=1`: `0.091 ms` kernel-only, `0.123 ms` with simulated state gather/writeback
+    - recurrent `B=8,T=32`: `0.091 ms` kernel-only, `0.117 ms` with simulated state gather/writeback
+    - chunk `B=8,T=64`: `0.132 ms` kernel-only, `0.149 ms` with simulated state gather/writeback
+    - chunk `B=4,T=256`: `0.118 ms` kernel-only, `0.148 ms` with simulated state gather/writeback
+    - chunk `B=1,T=8192`: `0.471 ms` kernel-only, `0.485 ms` with simulated state gather/writeback
+  - Reading:
+    - isolated lightning kernels are not the obvious bottleneck
+    - short recurrent calls show noticeable but not dominant state-IO overhead
+    - for longer chunked prefill-style calls, the state-IO tax becomes very small relative to kernel time
+- 2026-04-20 10:55-11:05 CST: explored `SimpleGLAAttnBackend` more aggressively on `rtx6000-1` and landed a first probe-side optimization patch.
+  - Added reusable harness:
+    - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1/bench_simple_gla_variants.py`
+  - Remote benchmark artifacts:
+    - `simple_gla_state_b8_random_20260420.json`
+    - `simple_gla_state_b32_random_20260420.json`
+    - `simple_gla_state_b32_contig_20260420.json`
+    - `simple_gla_full_b8_t64_random_20260420.json`
+    - `simple_gla_full_b8_t256_ragged_random_20260420.json`
+    - `simple_gla_threshold_b8_uniform_random_20260420.json`
+    - `simple_gla_threshold_b8_ragged_random_20260420.json`
+  - Bench conclusions:
+    - `state[idx]` already returns contiguous tensors in the tested patterns; `.contiguous()` is effectively redundant here
+    - `index_copy_` is consistently faster than advanced-index assignment for temporal-state writeback
+    - the best chunk-path combination in the full-path microbench is `index_select + index_copy_`
+    - Blackwell crossover for `fused_recurrent_simple_gla` vs `chunk_simple_gla` is around `seq_len ~= 80`
+      - `64`: fused wins
+      - `72`: fused still wins narrowly
+      - `80+`: chunk wins
+    - `cu_seqlens_cpu` on the chunk path did not produce meaningful gains in this setup
+  - Probe patch in `hybrid_linear_attn_backend.py`:
+    - cache and reuse `mamba_indices`
+    - gather initial state with `index_select`
+    - write final state back with `index_copy_`
+    - map negative/padding indices to the reserved extra state slot
+    - bump fused/chunk cutoff from `<64` to `<80`
+  - Validation:
+    - first smoke exposed an `index_copy_` `int64` index requirement; fixed by promoting safe indices to `torch.int64`
+    - second smoke succeeded:
+      - `kv_probe_20260420_110420_linear-opt-smoke2`
+      - `flashinfer + auto KV`, server boot + short decode OK
+  - Working hypothesis:
+    - the linear backend’s near-term headroom is mostly in state bookkeeping and dispatch threshold tuning rather than Triton kernel surgery
+- 2026-04-20 11:35-11:52 CST: validated the linear-backend patch with a proper detached extreme A/B on `rtx6000-1`.
+  - Shared serving setup:
+    - weight: `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v1-gate0-fixorder`
+    - backend: `flashinfer`
+    - flags: `--force-dense-minicpm --chunked-prefill-size 8192 --disable-radix-cache --disable-cuda-graph --cuda-graph-max-bs=1`
+    - workload: `random-ids`, `256 x 32k/2k`, `max_concurrency=256`
+  - Baseline:
+    - tree: `...probe-v1-linear-baseline`
+    - run: `extreme_attnqkv-gate0-linear-baseline_20260420_113533`
+    - `duration=384.01s`
+    - `total tok/s=10836.62`
+    - `output tok/s=659.41`
+  - Patched:
+    - tree: `...probe-v1`
+    - run: `extreme_attnqkv-gate0-linear-patched2_20260420_114449`
+    - `duration=385.20s`
+    - `total tok/s=10803.04`
+    - `output tok/s=657.36`
+  - Interpretation:
+    - end-to-end result is effectively flat, with patched slightly behind baseline (`~0.31%` lower total throughput)
+    - the microbench improvements in state gather/writeback and the `80`-token cutoff shift do not materially move the whole serving stack on this workload
+    - likely reasons:
+      - linear backend is not the dominant bottleneck in this production-shaped case
+      - wins in per-layer bookkeeping are drowned out by full-attn, scheduler, and macro-level request dynamics
+    - recommendation:
+      - do not upstream this patch as a serving default
+      - keep the harness around for future experiments, but shift optimization attention back to higher-leverage bottlenecks
+- 2026-04-20 12:11-12:12 CST: validated a lighter hybrid FP8 KV route on `rtx6000-2`.
+  - Remote probe tree was partially stale, so I synced the minimal mixed-KV files from local:
+    - `run_probe_server.sh`
+    - `run_kv_probe_smoke.sh`
+    - `server_args.py`
+    - `model_runner_kv_cache_mixin.py`
+    - `flashinfer_backend.py`
+  - Smoke config:
+    - weight: `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1`
+    - backend: `flashinfer`
+    - `kv_cache_dtype=fp8_e4m3`
+    - `kv_cache_protect_layers=29,30,31`
+    - plus dense-winning flags: `--force-dense-minicpm --chunked-prefill-size 8192 --disable-radix-cache --disable-cuda-graph`
+  - Result:
+    - run dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/kv_probe_20260420_121134_fp8_tail3`
+    - boot + `/v1/models` + short decode all succeeded
+    - `ttft_ms=10109.626`
+    - `request_latency_ms=10226.461`
+  - Server-side confirmation:
+    - mixed KV path was active
+    - requested protected layers `[29, 30, 31]`
+    - effective protected full-attn layers `[29, 30, 31]`
+    - no ignored layers
+  - Interpretation:
+    - a lighter tail-only BF16 protect set is viable on top of `full fp8 KV`
+    - this is a cleaner next candidate than the earlier heavier `0,29,30,31` protect set
+- 2026-04-20 12:07-12:35 CST: completed the first Nsight-guided pass over the MiniCPM `SimpleGLA` backend on `rtx6000-1`.
+  - Tooling status:
+    - usable `nsys` binary: `/opt/nvidia/nsight-compute/2025.1.1/host/target-linux-x64/nsys`
+    - `ncu` launch works, but counter collection is blocked by `ERR_NVGPUCTRPERM`; this machine cannot currently provide occupancy / stall / L2 metrics from Nsight Compute
+    - extended local tooling with:
+      - `bench_simple_gla_variants.py` support for `fused_chunk_simple_gla`
+      - `profile_simple_gla_case.py` for isolated NVTX-instrumented runs
+      - detached `nsys` / `ncu` helper scripts
+    - fixed the detached `nsys` runner so it:
+      - handles `.nsys-rep`
+      - exits cleanly when `nsys` kills the traced server after a bounded capture window
+  - System-level `nsys` on the baseline serving tree with attnqkv-gate0 weight:
+    - prefill-heavy window:
+      - run: `nsys_extreme_attnqkv-gate0-nsys-prefill_20260420_120743`
+      - total GPU kernel time: `44.288s`
+      - `SimpleGLA` share:
+        - `chunk_fwd_kernel_o = 596.8ms`
+        - `chunk_fwd_kernel_h = 409.8ms`
+        - combined `~2.27%`
+      - conclusion: prefill-side `SimpleGLA` is not a first-order bottleneck
+    - decode-heavy window:
+      - run: `nsys_extreme_attnqkv-gate0-nsys-decode_20260420_121605`
+      - total GPU kernel time: `43.566s`
+      - `fused_recurrent_fwd_kernel = 7.458s` (`~17.1%`)
+      - neighboring large decode-window GPU ops:
+        - `index_elementwise_kernel = 7.874s`
+        - `vectorized_gather_kernel = 7.025s`
+      - conclusion: decode-side `SimpleGLA` matters, but state-indexing GPU work is similarly large
+  - Isolated NVTX-instrumented `nsys` runs:
+    - decode-shaped fused recurrent:
+      - run: `nsys_simple_gla_fusedio_20260420_122753`
+      - `variant=fused`, `batch=128`, `seq_len=1`, `include_state_io=true`
+      - `~1.09ms/iter`
+      - GPU-kernel split over 25 profiled iterations:
+        - `vectorized_gather_kernel ~= 9.02ms`
+        - `fused_recurrent_fwd_kernel ~= 8.62ms`
+        - `index_copy/index_elementwise ~= 9.17ms`
+      - read: wrapper-side state gather/writeback is as important as the recurrent kernel in decode mode
+    - chunk, medium-length batched prefill shape:
+      - run: `nsys_simple_gla_chunkio_20260420_122832`
+      - `variant=chunk`, `batch=128`, `seq_len=64`, `include_state_io=true`
+      - `~1.61ms/iter`
+      - split:
+        - `chunk_fwd_kernel_h ~= 13.87ms`
+        - `chunk_fwd_kernel_o ~= 7.22ms`
+        - `state_gather ~= 8.85ms`
+        - `state_writeback ~= 8.35ms`
+      - read: in this regime, `h` is heavier than `o` and state IO remains material
+    - chunk, real `8192` prefill chunk shape:
+      - run: `nsys_simple_gla_chunkio_b1t8192_20260420_123053`
+      - `variant=chunk`, `batch=1`, `seq_len=8192`, `include_state_io=true`
+      - `~0.54ms/iter`
+      - split:
+        - `chunk_fwd_kernel_o ~= 3.58ms`
+        - `chunk_fwd_kernel_h ~= 2.23ms`
+        - `state_gather + state_writeback < 0.10ms`
+      - read: for the actual `8192` prefill chunk, `o` is the heavier kernel and state IO is basically irrelevant
+  - Threshold sweep at `batch=128`:
+    - output: `simple_gla_threshold_b128_20260420_122557.json`
+    - winners by sequence length:
+      - `fused` at `<=8`
+      - `fused_chunk` around `16-32`
+      - `chunk/chunk_cpu` from `48+`
+    - implication:
+      - `fused_chunk_simple_gla` is not a universal replacement; it only helps in a narrow mid-length band
+  - Optimization direction after profiling:
+    - stop treating prefill-side `chunk_simple_gla` as the main target
+    - if continuing on this backend, focus on decode-side `fused_recurrent` plus state gather/writeback together
+    - without `ncu` counter access, the current evidence ceiling on this machine is `nsys + isolated NVTX`
+- 2026-04-20 12:43-13:58 CST: validated `mamba_ssm_dtype=bfloat16` on the current `attnW+mlpW gate0-fixorder` baseline with a real official full eval on `rtx6000-1`.
+  - Patched the attnQKV tree with the same minimal dtype-cast writeback fix already proven on the winning route:
+    - cast `final_state` to `layer_cache.temporal.dtype` before saving it in `SimpleGLAAttnBackend`
+  - Run:
+    - dir: `/root/autodl-tmp/SOAR-Toolkit/test_results/official_attnqkv_gate0_fixorder_mamba_bf16_20260420_124628`
+    - weight: `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v1-gate0-fixorder`
+  - Memory/capacity effect vs float32 gate0 baseline:
+    - float32:
+      - `ssm_state size: 24.05GB`
+      - `max_total_num_tokens=6369605`
+    - bf16:
+      - `ssm_state size: 12.02GB`
+      - `max_total_num_tokens=8004353`
+    - net:
+      - `~50%` lower state memory
+      - `~25.7%` higher token capacity
+  - Final metrics:
+    - `Average Score: 81.69%` vs baseline `81.11%`
+    - `Total Duration: 4270.89 s` vs baseline `3767.77 s`
+    - `Total Tokens Out: 1493022` vs baseline `1193331`
+    - `Overall TPS (Output): 349.58` vs baseline `316.72`
+  - Read:
+    - unlike the older winning-route bf16 experiment, this one did not collapse quality
+    - the tradeoff here is different:
+      - better state memory / token capacity
+      - slightly better score
+      - better output TPS
+      - but clearly worse wall-clock duration because the model generated many more output tokens / tails
+  - Current position:
+    - `mamba_ssm_dtype=bfloat16` is now a legitimate runtime variant for the attnQKV gate0 line
+    - it should not be promoted to default yet without a strategy for controlling the longer generations it induces
+- 2026-04-20 14:10-14:50 CST: tested whether decode-side state locality can be improved just by sorting `SimpleGLA` requests by `mamba_indices` before gather/recurrent/writeback.
+  - Implementation in probe tree:
+    - extended `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1/bench_simple_gla_variants.py` with `clustered` and `sorted_random` index patterns
+    - added a probe-only env flag in `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1/sglang/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`:
+      - `SGLANG_SIMPLE_GLA_SORT_DECODE_BY_STATE=1`
+      - behavior:
+        - sort decode batch by `mamba_indices`
+        - reorder `q/k/v`
+        - gather/writeback in sorted slot order
+        - invert the permutation on `o` before returning
+  - Microbench result on `rtx6000-1` (decode-shaped `batch=128, seq_len=1`):
+    - output dir:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/simplegla_locality_20260420`
+    - state gather/write and full-path timings were effectively tied across `random`, `sorted_random`, `clustered`, and `contiguous`
+    - no meaningful locality win appeared at the isolated-kernel level
+  - End-to-end extreme A/B on the current best attnQKV gate0 weight:
+    - weight:
+      - `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v1-gate0-fixorder`
+    - baseline:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/extreme_attnqkv-gate0-sgla-base_20260420_143449`
+      - `duration=384.75 s`
+      - `total tok/s=10815.85`
+      - `output tok/s=658.14`
+    - sorted decode:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/extreme_attnqkv-gate0-sgla-sortdecode_20260420_144234`
+      - `duration=389.29 s`
+      - `total tok/s=10689.76`
+      - `output tok/s=650.47`
+    - net:
+      - `~-1.17%` total throughput
+      - `~-1.17%` output throughput
+      - `~+1.18%` duration
+  - Read:
+    - the decode-side bottleneck is real, but naive slot-order sorting is not the right fix
+    - the next credible step, if continuing, would be a deeper change such as fused indexed recurrent/state IO rather than wrapper-level batch reordering

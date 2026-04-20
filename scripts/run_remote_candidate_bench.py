@@ -24,14 +24,18 @@ from datetime import datetime
 from pathlib import Path
 
 
-REMOTE_HOST = "rtx6000-2"
-REMOTE_SOAR_ROOT = "/root/autodl-tmp/SOAR-Toolkit"
-REMOTE_SGLANG_ROOT = "/root/autodl-tmp/sglang"
-REMOTE_PYTHON = f"{REMOTE_SGLANG_ROOT}/sglang_minicpm_sala_env/bin/python3"
-REMOTE_ENV = (
+REMOTE_HOST = os.environ.get("SOAR_REMOTE_HOST", "rtx6000-2")
+REMOTE_SOAR_ROOT = os.environ.get("SOAR_REMOTE_SOAR_ROOT", "/root/autodl-tmp/SOAR-Toolkit")
+REMOTE_SGLANG_ROOT = os.environ.get("SOAR_REMOTE_SGLANG_ROOT", "/root/autodl-tmp/sglang")
+REMOTE_PYTHON = os.environ.get(
+    "SOAR_REMOTE_PYTHON",
+    f"{REMOTE_SGLANG_ROOT}/sglang_minicpm_sala_env/bin/python3",
+)
+REMOTE_ENV = os.environ.get(
+    "SOAR_REMOTE_ENV",
     "source /etc/network_turbo >/dev/null 2>&1; "
     "export HF_ENDPOINT=https://hf-mirror.com; "
-    "source /root/autodl-tmp/use_soar_uv.sh >/dev/null 2>&1"
+    "source /root/autodl-tmp/use_soar_uv.sh >/dev/null 2>&1",
 )
 REMOTE_RESULTS_ROOT = f"{REMOTE_SOAR_ROOT}/test_results/candidate_benches"
 
@@ -54,6 +58,10 @@ FAST_EVAL_COMPLETION_CAPS = {
     "fwe": 256,
     "cwe": 256,
 }
+PUBLIC_SPEED_SOURCE = f"{REMOTE_SOAR_ROOT}/eval_dataset/perf_public_set.jsonl"
+PUBLIC_SPEED_DATA = f"{REMOTE_SOAR_ROOT}/bench_speed_public_full.jsonl"
+PUBLIC_SPEED_META = f"{REMOTE_SOAR_ROOT}/bench_speed_public_full.meta.json"
+PUBLIC_SPEED_TASK_ORDER = ("mcq", "qa", "niah", "fwe", "cwe")
 
 PROXY_SELECTION = {
     # Target input-bucket counts for 11 rows are:
@@ -620,6 +628,250 @@ PY
     ssh(script)
 
 
+def ensure_public_speed_dataset(
+    model_path: str,
+    *,
+    completion_cap: int | None,
+    per_task_bucket: int | None,
+) -> dict:
+    task_order_json = json.dumps(list(PUBLIC_SPEED_TASK_ORDER), ensure_ascii=False)
+    completion_cap_literal = "None" if completion_cap is None else str(int(completion_cap))
+    per_task_bucket_literal = "None" if per_task_bucket is None else str(int(per_task_bucket))
+    script = """
+set -e
+%s
+%s - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+source_path = Path(%r)
+target_path = Path(%r)
+meta_path = Path(%r)
+model_path = %r
+task_order = json.loads(%r)
+completion_cap = %s
+per_task_bucket = %s
+
+rows = [
+    json.loads(line)
+    for line in source_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+
+def bucket(prompt_tokens: int) -> str:
+    if prompt_tokens < 4096:
+        return "0-4K"
+    if prompt_tokens < 16384:
+        return "4-16K"
+    if prompt_tokens < 32768:
+        return "16K-32K"
+    if prompt_tokens < 131072:
+        return "32K-128K"
+    return "128K-160K"
+
+def evenly_pick(items, k):
+    if k is None:
+        return list(items)
+    if k <= 0 or not items:
+        return []
+    if len(items) <= k:
+        return list(items)
+    picked = []
+    used = set()
+    n = len(items)
+    for i in range(k):
+        pos = round(i * (n - 1) / (k - 1)) if k > 1 else n // 2
+        while pos in used and pos + 1 < n:
+            pos += 1
+        while pos in used and pos - 1 >= 0:
+            pos -= 1
+        if pos in used:
+            continue
+        used.add(pos)
+        picked.append(items[pos])
+    return picked
+
+def find_repeat_token_id() -> tuple[int, str]:
+    seed_texts = [" a", " hello", " test", " the", " word", " ok", ".", ",", " 1"]
+    candidate_ids = []
+    for text in seed_texts:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) == 1 and ids[0] not in special_ids:
+            candidate_ids.append(ids[0])
+    vocab_cap = min(int(getattr(tokenizer, "vocab_size", 8192) or 8192), 8192)
+    candidate_ids.extend(tid for tid in range(vocab_cap) if tid not in special_ids)
+
+    seen = set()
+    for tid in candidate_ids:
+        if tid in seen or tid in special_ids:
+            continue
+        seen.add(tid)
+        text = tokenizer.decode(
+            [tid] * 64,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if not text:
+            continue
+        if len(tokenizer.encode(text, add_special_tokens=False)) == 64:
+            piece = tokenizer.decode(
+                [tid],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            return tid, piece
+    raise RuntimeError("Failed to find a stable repeat token for synthetic speed outputs")
+
+repeat_token_id, repeat_piece = find_repeat_token_id()
+
+def build_response(target_tokens: int) -> tuple[str, int]:
+    if target_tokens <= 0:
+        return "", 0
+    ids = [repeat_token_id] * target_tokens
+    text = ""
+    actual = 0
+    for _ in range(8):
+        text = tokenizer.decode(
+            ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        actual = len(tokenizer.encode(text, add_special_tokens=False))
+        if actual == target_tokens:
+            return text, actual
+        diff = target_tokens - actual
+        if diff > 0:
+            ids.extend([repeat_token_id] * diff)
+        else:
+            keep = max(1, len(ids) + diff)
+            ids = ids[:keep]
+    return text, actual
+
+rows_by_task = {task: [] for task in task_order}
+selected_rows = []
+rows_by_task_bucket = {}
+for row in rows:
+    task = str(row.get("task", ""))
+    rows_by_task.setdefault(task, []).append(row)
+    bkt = bucket(int(row.get("prompt_tokens", 0)))
+    rows_by_task_bucket.setdefault((task, bkt), []).append(row)
+
+if per_task_bucket is not None:
+    selected_rows = []
+    for key, task_bucket_rows in sorted(rows_by_task_bucket.items()):
+        task_bucket_rows = sorted(
+            task_bucket_rows,
+            key=lambda row: (
+                int(row.get("prompt_tokens", 0)),
+                int(row.get("completion_tokens", 0)),
+                int(row.get("index", 0)),
+            ),
+        )
+        selected_rows.extend(evenly_pick(task_bucket_rows, per_task_bucket))
+else:
+    selected_rows = list(rows)
+
+rows_by_task = {task: [] for task in task_order}
+for row in selected_rows:
+    task = str(row.get("task", ""))
+    rows_by_task.setdefault(task, []).append(row)
+
+for task_rows in rows_by_task.values():
+    task_rows.sort(
+        key=lambda row: (
+            int(row.get("prompt_tokens", 0)),
+            int(row.get("completion_tokens", 0)),
+            int(row.get("index", 0)),
+        )
+    )
+
+ordered_rows = []
+max_task_rows = max((len(task_rows) for task_rows in rows_by_task.values()), default=0)
+for pos in range(max_task_rows):
+    for task in task_order:
+        task_rows = rows_by_task.get(task, [])
+        if pos < len(task_rows):
+            ordered_rows.append(task_rows[pos])
+
+bench_rows = []
+actual_completion_tokens = []
+target_completion_tokens = []
+for row in ordered_rows:
+    completion_tokens_source = int(row.get("completion_tokens", 0))
+    completion_tokens_target = completion_tokens_source
+    if completion_cap is not None:
+        completion_tokens_target = min(completion_tokens_target, int(completion_cap))
+    model_response, completion_tokens_actual = build_response(completion_tokens_target)
+    target_completion_tokens.append(completion_tokens_target)
+    actual_completion_tokens.append(completion_tokens_actual)
+    bench_rows.append(
+        {
+            "task": row.get("task"),
+            "index": row.get("index"),
+            "question": row.get("question", ""),
+            "model_response": model_response,
+            "prompt_tokens_source": int(row.get("prompt_tokens", 0)),
+            "completion_tokens_source": completion_tokens_source,
+            "completion_tokens_bench_target": completion_tokens_target,
+            "completion_tokens_bench_actual": completion_tokens_actual,
+        }
+    )
+
+target_path.write_text(
+    "".join(json.dumps(row, ensure_ascii=False) + "\\n" for row in bench_rows),
+    encoding="utf-8",
+)
+
+meta = {
+    "source": str(source_path),
+    "model_path": model_path,
+    "count": len(bench_rows),
+    "task_order": list(task_order),
+    "completion_cap": completion_cap,
+    "per_task_bucket": per_task_bucket,
+    "repeat_token_id": repeat_token_id,
+    "repeat_piece_preview": repeat_piece[:32],
+    "by_task": dict(sorted(Counter(str(row.get("task", "")) for row in bench_rows).items())),
+    "by_bucket": dict(
+        sorted(
+            Counter(bucket(int(row.get("prompt_tokens_source", 0))) for row in bench_rows).items()
+        )
+    ),
+    "prompt_tokens_total": sum(int(row.get("prompt_tokens_source", 0)) for row in bench_rows),
+    "completion_tokens_source_total": sum(
+        int(row.get("completion_tokens_source", 0)) for row in bench_rows
+    ),
+    "completion_tokens_bench_target_total": sum(target_completion_tokens),
+    "completion_tokens_bench_actual_total": sum(actual_completion_tokens),
+    "max_completion_delta": max(
+        abs(target - actual)
+        for target, actual in zip(target_completion_tokens, actual_completion_tokens)
+    ) if bench_rows else 0,
+}
+meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+print(json.dumps(meta, ensure_ascii=False))
+PY
+""" % (
+        REMOTE_ENV,
+        REMOTE_PYTHON,
+        PUBLIC_SPEED_SOURCE,
+        PUBLIC_SPEED_DATA,
+        PUBLIC_SPEED_META,
+        model_path,
+        task_order_json,
+        completion_cap_literal,
+        per_task_bucket_literal,
+    )
+    proc = ssh(script)
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
 def parse_fast_eval(output: str) -> tuple[float | None, int | None, int | None, int | None]:
     match = re.search(
         r"avg_score=([0-9.]+)%\s+pass=(\d+)\s+part=(\d+)\s+fail=(\d+)",
@@ -664,7 +916,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunked-prefill-size", type=int, default=8192)
     parser.add_argument(
         "--profile",
-        choices=["smoke", "speed-smoke", "proxy", "mini", "mini-eval", "fast-eval", "medium-eval", "eval-only", "bench-only", "official"],
+        choices=[
+            "smoke",
+            "speed-smoke",
+            "proxy",
+            "public-speed",
+            "mini",
+            "mini-eval",
+            "fast-eval",
+            "medium-eval",
+            "eval-only",
+            "bench-only",
+            "official",
+        ],
         default="smoke",
     )
     parser.add_argument("--official-data-path", default="eval_dataset/perf_public_set.jsonl")
@@ -677,6 +941,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fuse-topk", action="store_true")
     parser.add_argument("--split-stage1", action="store_true")
     parser.add_argument("--max-running-requests", type=int, default=None)
+    parser.add_argument("--public-speed-completion-cap", type=int, default=None)
+    parser.add_argument("--public-speed-per-task-bucket", type=int, default=None)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--extra-server-arg", action="append", default=[])
     return parser.parse_args()
@@ -739,6 +1005,16 @@ def main() -> int:
             ensure_proxy_dataset()
         if args.profile == "fast-eval":
             ensure_fast_eval_dataset()
+        if args.profile == "public-speed":
+            public_speed_meta = ensure_public_speed_dataset(
+                args.model_path,
+                completion_cap=args.public_speed_completion_cap,
+                per_task_bucket=args.public_speed_per_task_bucket,
+            )
+            print(
+                "[bench] public_speed_meta="
+                + json.dumps(public_speed_meta, ensure_ascii=False)
+            )
 
         pid, server_log = start_server(args, run_dir)
         print(f"[bench] server pid={pid}")
@@ -825,6 +1101,18 @@ def main() -> int:
             )
             smoke_duration = parse_bench_json(bench_out)
             print(f"[bench] proxy_duration={smoke_duration}")
+
+        if args.profile == "public-speed":
+            bench_out, bench_smoke_log = run_bench(
+                args.port,
+                run_dir,
+                s1=PUBLIC_SPEED_DATA,
+                s8=PUBLIC_SPEED_DATA,
+                smax=PUBLIC_SPEED_DATA,
+                log_name="bench_public_speed.log",
+            )
+            smoke_duration = parse_bench_json(bench_out)
+            print(f"[bench] public_speed_duration={smoke_duration}")
 
         if args.profile == "mini":
             bench_out, bench_mini_log = run_bench(

@@ -4246,3 +4246,356 @@ ssh rtx6000-2 'source /root/autodl-tmp/use_soar_uv.sh >/dev/null 2>&1 && pkill -
   - `19:22:54`: GPU `50.71 GiB`, RSS `51.27 GiB`, cgroup current `48.72 GB`
   The run has already moved past layer 1 and into layer 2 replay, which is a much healthier start than the previous all-CPU-output-cache attempt.
 - 2026-04-13 19:28 CST: Root/system disk pressure was traced to GPTQModel's auto-generated relative offload root: `./gptqmodel_offload/...`, which resolved to `/root/gptqmodel_offload` on the clone server. Before cleanup, `/root/gptqmodel_offload` was `16 GiB`, while the active run only needed the newest directory (`vjjihpmw-yxejlwbe`, ~`874 MiB`). Deleted stale offload trees from older runs; root overlay usage dropped from `81%` to `33%` immediately. Added local support for explicit `--offload-to-disk-path` and wrapper env `OFFLOAD_TO_DISK_PATH` so future runs can send offload data to `/root/autodl-tmp/gptqmodel_offload` instead of the 30G system overlay.
+
+## 2026-04-14 official verdict on `strongerclose100`
+
+- The recent official submission on the `strongerclose100` branch returned:
+  - `acc = 96.89`
+  - `acc_ori = 77.51`
+  - `final_score = 0.0`
+  - `S1 = 587.12`
+  - `S8 = 712.25`
+  - `Smax = 1204.8`
+- High-confidence route mapping:
+  - packaged candidate:
+    - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-publichybrid-noattn-skipdown151617-strongerclose100-v1`
+  - first attempt inside the package:
+    - `strongerclose100_noattn_skipdown151617_v1`
+- Interpretation:
+  - this route fails the official `97` accuracy gate, so it is eliminated regardless of runtime
+  - it is also slower than the earlier winning `99.97 / 48.2` package
+  - therefore the `100`-sample stronger-close calibration line should be treated as a dead branch, not a candidate awaiting more runtime tuning
+- Practical decision:
+  - do not revive `strongerclose100`
+  - keep it only as evidence that adding the 24-row close-state mix in this specific no-attn package did not transfer to official accuracy and did not buy speed
+
+## 2026-04-14 attnW allowlist experiment on top of the winning package
+
+- Goal:
+  - test a **small fused-QKV attention-weight re-enable** on top of the current `99.97 / 48.2` winning package **without modifying the winning package itself**
+- New isolated experiment package:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1`
+- Winning package kept untouched:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-publichybrid-noattn-skipdown151617-v1`
+- First-attempt dynamic config:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/configs/selective_marlin/attnqkv-allowlist-v1.json`
+- Allowlist semantics:
+  - positive allowlist first for:
+    - layers `10,12,13,14,19,20,21,23`
+    - `self_attn.(q_proj|k_proj|v_proj)`
+    - `self_attn.qkv_proj`
+  - then global negatives for:
+    - all attention `q/k/v/o`
+    - all fused `qkv_proj`
+    - `mlp.down_proj` on layers `15/16/17`
+- Important structural rule preserved:
+  - no shard-level mixed quant inside fused `qkv_proj`
+  - this experiment only ever re-enables full `q+k+v` groups
+  - `o_proj` remains globally skipped
+
+### What was verified before the quant smoke failed
+
+- Remote quant env checks confirmed:
+  - `dynamic_get(...)` uses first-match semantics
+  - the regex ordering in `attnqkv-allowlist-v1.json` is therefore critical and currently correct
+  - `simple_layer_modules()` includes attention groups:
+    - `self_attn.q_proj`
+    - `self_attn.k_proj`
+    - `self_attn.v_proj`
+    - `self_attn.o_proj`
+    - plus the MLP triple
+- Additional diagnostics were temporarily monkey-patched into:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/quantize_gptq_w4a16.py`
+  to log:
+  - `stage_layer_modules`
+  - `create_named_modules_pre/post`
+  - `gptq_preprocess_pre/post`
+- Non-allowlist layer 0 behaved as expected:
+  - attention groups were visible to the looper
+  - but GPTQ task creation stayed disabled (`task_created=false`)
+  - confirming that the global negative path still works as intended for skipped layers
+
+### Quant-smoke outcome
+
+- Primary log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/attnqkv_allowlist_v1_fix3_20260414_prepare.log`
+- The experiment failed on the first attempt:
+  - `[prepare_model] failed on publichybrid_attnqkv_allowlist_v1`
+- Failure mode:
+  - `torch.OutOfMemoryError`
+  - attempted allocation: `460 MiB`
+- Failure site:
+  - same MiniCPM long-context calibration replay attention path as before:
+    - `modeling_minicpm_sala.py`
+    - `chunk_simple_gla`
+    - `chunk_fwd_o`
+    - `torch.empty_like(v)`
+- Crucial interpretation:
+  - this is **not** a fused `qkv_proj` loader or shape mismatch failure
+  - it is a quant-time GPU memory failure caused by re-enabling part of attnW while keeping the winning quant recipe otherwise unchanged
+- Also important:
+  - no `layer_index = 10` diagnostic rows were ever emitted before the OOM
+  - so the run died before reaching the first allowlisted layer
+  - that means we never got to validate actual task creation on an allowlisted layer in this exact run
+
+### Decision
+
+- `attnqkv-allowlist-v1` is currently a **failed quant-smoke branch**
+- Reason:
+  - under the winning calibration and winning quant-time memory strategy,
+  - even a narrow QKV re-enable is enough to push calibration replay back into the old attention OOM regime
+- Therefore:
+  - do not advance this exact branch to serve smoke or fast gate
+  - only revisit attention-weight re-enable if we are willing to relax the “keep the winning quant recipe unchanged” constraint
+
+### Reusable tooling kept in the experiment package
+
+- manifest checker:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/check_attn_allowlist_manifest.py`
+- exact-serve launcher:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/run_attnqkv_server.sh`
+- exact-serve smoke wrapper:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/run_attnqkv_smoke.sh`
+- backup config (not activated):
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/configs/selective_marlin/attnqkv-allowlist-v2.json`
+- package execution semantics were also tightened after this run:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/prepare_model.sh`
+  - now stops immediately after the primary `attnqkv_allowlist_v1` failure
+  - it no longer falls through to inherited `stopaligned64k`, `true160k`, or `pg19` fallback attempts, because those are unrelated to the attnW-isolation experiment
+
+## 2026-04-15: Clean Gate 0 rerun on `rtx6000-1`
+
+### Why rerun
+
+- The previous allowlist OOM was not a clean sample:
+  - another quant process on the same GPU had consumed about `69.5 GiB`
+- Before escalating to staged attn-only quant, a clean single-process rerun was required
+
+### Local experiment-package prep
+
+- Added an attn-only config for staged follow-up:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/configs/selective_marlin/attnqkv-attnonly-v1.json`
+- Added a staged helper:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/run_attnqkv_quant_gate.sh`
+  - `gate0` -> exact allowlist rerun
+  - `attn24k` -> attn-only + `--calibration-concat-size 24576`
+  - `attn16k` -> attn-only + `--calibration-concat-size 16384`
+- Patched the experiment quant entrypoint to support `--offload-to-disk-path`
+  - the remote wrapper already passed this flag, and the first rerun failed immediately until the package was updated
+
+### Remote clean rerun
+
+- Server:
+  - `rtx6000-1`
+- Log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/attnqkv_gate0_20260415_111838.log`
+- Output target:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v1-gate0`
+- Quant settings:
+  - exact winning `115`-row reduced publichybrid calibration
+  - same winning quant args
+  - same `attnqkv-allowlist-v1` config
+  - `--cpu-cache-layer-outputs`
+  - no `gpu-cache-max-gib`
+
+### Mid-run status snapshot
+
+- Confirmed clean single-process execution:
+  - no competing `quantize_gptq_w4a16.py` process on the same GPU
+- The rerun got materially farther than the contaminated attempt:
+  - progressed into real GPTQ quant/replay
+  - by the latest checked poll it had reached `Quantizing layer 9 of 31`
+- At that poll:
+  - GPU used about `8171 MiB / 97887 MiB`
+  - no fresh `CUDA out of memory`
+  - no `Traceback`
+  - no terminal failure line yet
+
+### Current interpretation
+
+- The earlier allowlist OOM cannot be treated as a clean attnW verdict
+- The single-process Gate 0 rerun is the new decision point:
+  - if it succeeds, we advance to manifest/serve/fast
+  - if it still OOMs cleanly, then we move to staged attn-only `24k` and `16k`
+
+## 2026-04-15: Dynamic-rule ordering bug in attnQKV allowlist
+
+### What happened
+
+- The clean Gate 0 rerun advanced well past startup and even crossed `layer 10`
+- But targeted diagnostics showed that allowlisted attention modules were still not creating GPTQ tasks:
+  - `model.layers.10.self_attn.q_proj`
+  - `model.layers.10.self_attn.k_proj`
+  - `model.layers.10.self_attn.v_proj`
+  - all reported `task_created=false`
+- Therefore that rerun was a **false-positive Gate 0**
+  - it was not actually quantizing allowlisted attnQKV
+
+### Root cause
+
+- `gptqmodel.quantization.config.QuantizeConfig` reorders `dynamic` rules in `__post_init__`
+- Specifically, it moves all negative rules ahead of positive rules
+- `dynamic_get()` is first-match
+- So the global negative attention skip shadows the earlier positive allowlist, even though the JSON file itself is ordered correctly
+
+### Fix
+
+- Patched:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/quantize_gptq_w4a16.py`
+- After constructing `QuantizeConfig(...)`, restore:
+  - `qc.dynamic = dict(dynamic_config)`
+  - but only for `attnqkv` experiment configs
+- Runtime marker added:
+  - `[compat] restored attnqkv dynamic rule order after QuantizeConfig init`
+
+### Relaunch notes
+
+- A second issue was also found during restart:
+  - `/root/autodl-tmp/codex-drafts/remote_quant_gptq_py310.sh` uses environment variables, not positional arguments
+  - two restart attempts accidentally fell back into the wrapper's default `quantcheck`
+- Those stray runs were cleaned up and Gate 0 was relaunched correctly with env vars:
+  - log:
+    - `/root/autodl-tmp/SOAR-Toolkit/test_results/attnqkv_gate0_fixorder_20260415_114856.log`
+  - output:
+    - `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v1-gate0-fixorder`
+
+### Current state
+
+- The corrected Gate 0 rerun is alive on `rtx6000-1`
+- At the latest check it had not yet reached `layer 10`
+- So the next real decision point is:
+  - do allowlisted attention QKV modules finally show `task_created=true` under the fixed rule order?
+
+## 2026-04-15: Gate 0 became a real attnW experiment
+
+### Validation at the first allowlisted layer
+
+- Remote log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/attnqkv_gate0_fixorder_20260415_114856.log`
+- At `model.layers.10` the diagnostics now show the intended behavior:
+  - `self_attn.q_proj` -> `dynamic: {}` and `task_created=true`
+  - `self_attn.k_proj` -> `dynamic: {}` and `task_created=true`
+  - `self_attn.v_proj` -> `dynamic: {}` and `task_created=true`
+  - `self_attn.o_proj` -> `dynamic: false` and `task_created=false`
+
+### Interpretation
+
+- The `qc.dynamic` order-restoration fix worked
+- The corrected Gate 0 rerun is no longer a false-positive MLP-only replay
+- This is now a valid “winning recipe + narrow attnQKV re-enable” run
+
+### Live status at this checkpoint
+
+- The run continued past the first allowlisted layer and had reached `layer 11 / 31`
+- Latest checked live state:
+  - GPU memory about `34.3 GiB / 97.9 GiB`
+  - no fresh `CUDA out of memory`
+  - no `Traceback`
+
+### Next decision point
+
+- Keep monitoring the corrected Gate 0 rerun to completion
+- Only if it later fails cleanly do we move to staged attn-only `24k` / `16k`
+
+## 2026-04-15: Runtime-only Mamba `bfloat16` full-eval path is now live
+
+### Scope
+
+- Checkpoint under test:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-publichybrid-noattn-skipdown151617-v1`
+- Machine:
+  - `rtx6000-2`
+- Serve route stayed on the winning dense fallback:
+  - `flashinfer`
+  - `--force-dense-minicpm`
+  - `--chunked-prefill-size 8192`
+  - `gptq_marlin`
+  - `dtype=float16`
+- Only variable changed:
+  - `--mamba-ssm-dtype bfloat16`
+
+### Root cause of the previous failure
+
+- The earlier bf16 runtime attempts had finally reached the first real request, and then crashed on a dtype mismatch during Mamba state writeback.
+- Error:
+  - `RuntimeError: Index put requires the source and destination dtypes match, got BFloat16 for the destination and Float for the source`
+- Concrete tensors:
+  - destination: `layer_cache.temporal`
+  - source: `final_state`
+
+### Fix
+
+- Patched the Mamba backend writeback so that `final_state` is cast to `layer_cache.temporal.dtype` before assignment when needed.
+- Patched file on the live runtime:
+  - `/root/autodl-tmp/sglang/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`
+
+### Verification
+
+- New run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/mamba_bf16_full_20260415_183508`
+- Output directory:
+  - `/root/autodl-tmp/SOAR-Toolkit/outputs/20260415_183524`
+- The corrected rerun is no longer a startup-only success:
+  - server reached `The server is fired up and ready to roll!`
+  - official full eval started
+  - progress advanced to at least `6/150`
+  - multiple requests returned `200 OK`
+  - decode throughput stayed around `~450-475 token/s` during the observed window
+
+### Current conclusion
+
+- `mamba_ssm_dtype=bfloat16` is now proven to enter real full eval on the winning checkpoint.
+- The previous blocker was a concrete runtime dtype mismatch, not a broader incompatibility of the bf16 Mamba idea.
+- Next useful comparison is no longer “can it run?” but “how do duration / score compare against the float32 baseline once the full run completes?”
+
+### Final verdict after the completed full eval
+
+- Completed run:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/mamba_bf16_full_20260415_183508`
+- Final metrics:
+  - `Average Score: 75.33%`
+  - `Total Duration: 2881.99 s`
+  - `Overall TPS (Output): 325.13`
+- Memory impact was substantial and real:
+  - same-route float32 Mamba state had `ssm_state size: 24.05GB`
+  - bf16 Mamba reduced it to `12.02GB`
+  - this also expanded `max_total_num_tokens` from `6,301,509` to `7,874,373`
+- But for the current winning route, the quality regression is too large to accept as a default runtime change.
+- Operational decision:
+  - treat `mamba bf16` as a useful runtime-feasibility / memory-capacity knob
+  - do not adopt it as the production serving default for the `99+` package
+
+## 2026-04-15: Gate 1 launched as the broader QKV allowlist expansion
+
+### Definition
+
+- `gate1` keeps the same winning-recipe base and the same attnQKV experiment package
+- It promotes the pre-existing broader allowlist file:
+  - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-attnqkv-allowlist-v1/configs/selective_marlin/attnqkv-allowlist-v2.json`
+- Coverage expands from the validated 8-layer QKV set:
+  - `10,12,13,14,19,20,21,23`
+- To the broader 18-layer QKV set:
+  - `1,2,3,4,5,6,10,12,13,14,19,20,21,23,24,25,26,28`
+
+### Invariants
+
+- Still only `q/k/v`
+- Still skip all `o_proj`
+- Still keep `mlp.down_proj` layers `15/16/17` unquantized
+- Calibration route remains:
+  - `publichybrid_semanticend49k_reduced_v1`
+  - `115` samples
+  - `float16`
+  - `bits=4`, `group_size=128`
+  - `offload-to-disk`, `exclusive` VRAM strategy, `on_stage_end` GC
+
+### Launch
+
+- Remote log:
+  - `/root/autodl-tmp/SOAR-Toolkit/test_results/attnqkv_gate1_v2_20260415_183526.log`
+- Remote output:
+  - `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v2-gate1`
+- First-screen check already passed:
+  - `dynamic_config_path` is the intended `attnqkv-allowlist-v2.json`
+  - no immediate `Traceback`
+  - no immediate `CUDA out of memory`
