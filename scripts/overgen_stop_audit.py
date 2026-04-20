@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -24,7 +25,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-output-tokens", type=int, default=0)
+    parser.add_argument("--mcq-suffix", default="")
+    parser.add_argument("--infer-mcq", action="store_true")
+    parser.add_argument(
+        "--mcq-patch-mode",
+        choices=["task_or_infer", "task_only", "infer_only"],
+        default="task_or_infer",
+    )
+    parser.add_argument("--task-filter", default="")
     return parser.parse_args()
+
+
+def extract_mcq_answer(text: str) -> str | None:
+    answer_matches = re.findall(r"(?i)ANSWER\s*:\s*([A-D])", text)
+    if answer_matches:
+        return answer_matches[-1].upper()
+    boxed_text_matches = re.findall(r"\\boxed\{\\text\{([A-D])\}\}", text)
+    if boxed_text_matches:
+        return boxed_text_matches[-1].upper()
+    boxed_matches = re.findall(r"\\boxed\{([A-D])\}", text)
+    if boxed_matches:
+        return boxed_matches[-1].upper()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        last = lines[-1]
+        line_match = re.search(r"([A-D])", last)
+        if line_match:
+            return line_match.group(1).upper()
+    return None
+
+
+def looks_like_mcq_prompt(text: str) -> bool:
+    lowered = text.lower()
+    has_answer_contract = "answer: $letter" in lowered or "one of abcd" in lowered
+    has_mcq_phrase = "multiple choice question" in lowered
+    has_letter_options = all(token in text for token in ["A)", "B)", "C)", "D)"])
+    return (has_answer_contract or has_mcq_phrase) and has_letter_options
 
 
 def load_stop_words(model_path: str) -> dict[str, Any]:
@@ -75,6 +111,9 @@ def main() -> int:
         for line in data_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    if args.task_filter:
+        allowed_tasks = {piece.strip() for piece in args.task_filter.split(",") if piece.strip()}
+        rows = [row for row in rows if row.get("task") in allowed_tasks]
     if args.max_samples > 0:
         rows = rows[: args.max_samples]
 
@@ -91,8 +130,24 @@ def main() -> int:
     audited_rows: list[dict[str, Any]] = []
     finish_counter: Counter[str] = Counter()
     task_finish_counter: dict[str, Counter[str]] = defaultdict(Counter)
+    patch_counter: Counter[str] = Counter()
 
     for index, row in enumerate(rows, start=1):
+        prompt = row["question"]
+        patch_reason = "none"
+        allow_task_patch = args.mcq_patch_mode in {"task_or_infer", "task_only"}
+        allow_infer_patch = args.mcq_patch_mode in {"task_or_infer", "infer_only"}
+        if args.mcq_suffix and allow_task_patch and row.get("task") == "mcq":
+            prompt = f"{prompt.rstrip()}\n\n{args.mcq_suffix}"
+            patch_reason = "task=mcq"
+        elif (
+            args.mcq_suffix
+            and args.infer_mcq
+            and allow_infer_patch
+            and looks_like_mcq_prompt(prompt)
+        ):
+            prompt = f"{prompt.rstrip()}\n\n{args.mcq_suffix}"
+            patch_reason = "infer=mcq"
         requested_max_tokens = (
             args.max_output_tokens
             if args.max_output_tokens > 0
@@ -100,7 +155,7 @@ def main() -> int:
         )
         payload = {
             "model": model_name,
-            "messages": [{"role": "user", "content": row["question"]}],
+            "messages": [{"role": "user", "content": prompt}],
             "temperature": args.temperature,
             "max_tokens": requested_max_tokens,
             "stop": stop_words,
@@ -123,15 +178,25 @@ def main() -> int:
         output_tokens = int(usage.get("completion_tokens", 0) or 0)
         prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
         total_tokens = int(usage.get("total_tokens", prompt_tokens + output_tokens) or 0)
+        mcq_extracted_answer = None
+        mcq_correct = None
+        if row.get("task") == "mcq":
+            mcq_extracted_answer = extract_mcq_answer(content or "")
+            if mcq_extracted_answer is not None and row.get("gold") is not None:
+                mcq_correct = mcq_extracted_answer.upper() == str(row["gold"]).upper()
+            else:
+                mcq_correct = False
 
         finish_counter[finish_reason] += 1
         task_finish_counter[row.get("task", "<unknown>")][finish_reason] += 1
+        patch_counter[patch_reason] += 1
 
         audited_rows.append(
             {
                 "index": index,
                 "task": row.get("task"),
                 "question": row["question"],
+                "effective_question": prompt,
                 "gold": row.get("gold"),
                 "dataset_prompt_tokens": row.get("prompt_tokens"),
                 "dataset_completion_tokens": row.get("completion_tokens"),
@@ -141,6 +206,9 @@ def main() -> int:
                 "api_total_tokens": total_tokens,
                 "finish_reason": finish_reason,
                 "wall_s": wall_s,
+                "patch_reason": patch_reason,
+                "mcq_extracted_answer": mcq_extracted_answer,
+                "mcq_correct": mcq_correct,
                 "prediction": content,
             }
         )
@@ -148,7 +216,9 @@ def main() -> int:
         print(
             f"{index:02d}/{len(rows)} task={row.get('task','?'):>4} "
             f"req_out={requested_max_tokens:>5} out={output_tokens:>5} "
-            f"finish={finish_reason:<8} wall={wall_s:>7.2f}s"
+            f"finish={finish_reason:<8} wall={wall_s:>7.2f}s "
+            f"patch={patch_reason:<9} "
+            f"mcq={mcq_extracted_answer if mcq_extracted_answer is not None else '-'}"
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +229,7 @@ def main() -> int:
         "data_path": str(data_path),
         "count": len(audited_rows),
         "stop_info": stop_info,
+        "patch_counts": dict(sorted(patch_counter.items())),
         "finish_reason_counts": dict(sorted(finish_counter.items())),
         "avg_output_tokens": (
             sum(row["api_completion_tokens"] for row in audited_rows) / len(audited_rows)

@@ -7545,3 +7545,135 @@ ssh rtx6000-2 'RUN_DIR=$(cat /root/autodl-tmp/SOAR-Toolkit/test_results/official
     - the decode-only sort-by-state experiment is a real negative result on this route
     - neither isolated microbench nor extreme A/B showed a meaningful locality gain
     - current evidence says the decode-side cost is not fixed by simply sorting the request order before state gather/recurrent/writeback
+- 2026-04-20 15:00-15:10 CST: implemented a real decode-only `indexed fused recurrent/state-io` prototype for `SimpleGLA` in the probe tree and validated it on `rtx6000-1`.
+  - Goal:
+    - skip Python-side state gather/writeback during decode
+    - let a Triton kernel directly:
+      - read the per-request state from `layer_cache.temporal` using `mamba_indices`
+      - apply the head-wise decay (`g_gamma`)
+      - update the state with the new `k/v`
+      - write the updated tile back in place
+      - accumulate the output `o`
+  - Implementation:
+    - added `_indexed_simple_gla_decode_kernel` to:
+      - `/Users/ql/cursor/openbmb/submission-w4a16-marlin-fusion-kvcache-probe-v1/sglang/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`
+    - added probe-only env flag:
+      - `SGLANG_SIMPLE_GLA_INDEXED_FUSED_DECODE=1`
+    - current scope:
+      - decode-only
+      - only when all `mamba_indices` are valid
+      - only when `layer_cache.temporal.dtype == torch.float32`
+      - prefill / prefix and bf16-state paths still fall back to the existing implementation
+  - Smoke validation:
+    - run dir:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/indexed_fused_decode_smoke_20260420_150059`
+    - result:
+      - server ready
+      - `/v1/models` ready
+      - short `/v1/chat/completions` request returned `200`
+      - no immediate Triton/kernel crash
+  - End-to-end extreme A/B against the current best attnQKV gate0 weight:
+    - baseline (same route, no indexed fused decode):
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/extreme_attnqkv-gate0-sgla-base_20260420_143449`
+      - `duration=384.75 s`
+      - `input tok/s=10157.71`
+      - `output tok/s=658.14`
+      - `total tok/s=10815.85`
+      - `mean TTFT=100481.15 ms`
+    - indexed fused decode:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/extreme_attnqkv-gate0-indexedfused_20260420_150150`
+      - `duration=366.90 s`
+      - `input tok/s=10651.76`
+      - `output tok/s=690.15`
+      - `total tok/s=11341.91`
+      - `mean TTFT=103546.45 ms`
+  - Deltas vs baseline:
+    - duration: `-17.85 s` (`~ -4.64%`)
+    - input tok/s: `+494.05` (`~ +4.86%`)
+    - output tok/s: `+32.01` (`~ +4.86%`)
+    - total tok/s: `+526.06` (`~ +4.86%`)
+    - mean TTFT: `+3065.30 ms` (`~ +3.05%`, worse)
+  - Read:
+    - unlike the earlier wrapper-level locality experiments, this deeper decode-only fused path does produce a meaningful end-to-end win
+    - the main gain shows up in sustained throughput / TPOT / ITL rather than TTFT
+    - current caveat is scope: the prototype only covers float32-state decode with valid indices
+- 2026-04-20 17:16-17:31 CST: extended the decode-only indexed fused `SimpleGLA` prototype to `bfloat16` state and validated it on the same attnQKV gate0 route.
+  - Change:
+    - relaxed the fast-path gate from:
+      - `layer_cache.temporal.dtype == torch.float32`
+      - to:
+      - `layer_cache.temporal.dtype in (torch.float32, torch.bfloat16)`
+    - the Triton kernel still accumulates in fp32 and stores back to the underlying state dtype
+  - Smoke:
+    - run dir:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/indexed_fused_decode_bf16_smoke_20260420_171605`
+    - result:
+      - server ready
+      - short completion returned `200`
+  - bf16 baseline extreme A/B control:
+    - run dir:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/extreme_attnqkv-gate0-bf16-base_20260420_171646`
+    - metrics:
+      - `duration=377.32 s`
+      - `input tok/s=10357.81`
+      - `output tok/s=671.11`
+      - `total tok/s=11028.92`
+      - `mean TTFT=100781.12 ms`
+  - bf16 indexed fused extreme:
+    - run dir:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/extreme_attnqkv-gate0-bf16-indexedfused_20260420_172342`
+    - metrics:
+      - `duration=351.44 s`
+      - `input tok/s=11120.36`
+      - `output tok/s=720.52`
+      - `total tok/s=11840.88`
+      - `mean TTFT=100875.83 ms`
+  - Deltas vs bf16 baseline:
+    - duration: `-25.88 s` (`~-6.86%`)
+    - input tok/s: `+762.55` (`~+7.36%`)
+    - output tok/s: `+49.41` (`~+7.36%`)
+    - total tok/s: `+811.96` (`~+7.36%`)
+    - mean TTFT: `+94.71 ms` (`~+0.09%`, effectively neutral)
+  - Read:
+    - the indexed fused decode path works on bf16 state without a new correctness failure
+    - the throughput win is even stronger on the bf16-state route than on float32 state
+    - among the linear-backend experiments in this round, this is now the strongest e2e optimization signal
+- 2026-04-20 17:54-18:00 CST: archived the current `SimpleGLA` docs and launched a submission-style full eval on the strongest matching gate0/cgbs1 route.
+  - Docs:
+    - created:
+      - `/Users/ql/cursor/openbmb/soar-docs/my_doc/champion/SimpleGLA/`
+    - included:
+      - `README.md`
+      - `nsight-rtx6000-1-env-2026-04-20.md`
+      - `simplegla-nsight-analysis-2026-04-20.md`
+      - `indexed-fused-decode-results-2026-04-20.md`
+    - packed root tarball:
+      - `/Users/ql/cursor/openbmb/SimpleGLA-docs-20260420.tar.gz`
+      - `sha256=209f542ee2851c00e283e0236b9932ffe5e263df7521a23533348954b7a0f518`
+  - Previous “best solution” backtrack:
+    - strongest local match for user-reported official result `acc=99.67 / final_score=37.32` is:
+      - `submission-w4a16-marlin-attnqkv-allowlist-gate0fixorder-cgbs1-v1`
+    - matched traits:
+      - `prepare_model.sh` uses `115` calibration samples
+      - `attnqkv-allowlist-v1`
+      - keeps `mlp.down_proj 15/16/17` in fp16
+      - runtime path:
+        - `flashinfer`
+        - `force-dense-minicpm`
+        - `--cuda-graph-max-bs 1`
+  - Runtime-patched tree synced to remote:
+    - `/root/autodl-tmp/codex-drafts/submission-w4a16-marlin-attnqkv-allowlist-gate0fixorder-cgbs1-indexedfused-v1`
+  - Full eval launched on `rtx6000-1`:
+    - run dir:
+      - `/root/autodl-tmp/SOAR-Toolkit/test_results/official_attnqkv_gate0_cgbs1_indexedfused_20260420_175906`
+    - model:
+      - `/root/autodl-tmp/models-gptq-w4a16-py310-attnqkv-allowlist-v1-gate0-fixorder`
+    - runtime delta:
+      - `SGLANG_SIMPLE_GLA_INDEXED_FUSED_DECODE=1`
+      - same `cgbs1` serve args otherwise
+    - early status:
+      - server ready
+      - short `/v1/chat/completions` smoke returned `200`
+      - `eval_model.py` entered:
+        - `Testing with 150 samples`
+        - `Generating responses`
