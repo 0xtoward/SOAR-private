@@ -1,0 +1,7 @@
+{
+  "+:^model(?:\\.model)?\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj)$": {"mse": 2.4},
+  "+:^model(?:\\.model)?\\.layers\\.\\d+\\.self_attn\\.qkv_proj$": {"mse": 2.4},
+  "-:^model(?:\\.model)?\\.layers\\.\\d+\\.self_attn\\.o_proj$": {},
+  "-:^model(?:\\.model)?\\.layers\\.(15|16|17)\\.mlp\\.down_proj$": {},
+  "+:^model(?:\\.model)?\\.layers\\.\\d+\\.mlp\\.(gate_proj|up_proj|down_proj)$": {"mse": 2.4}
+}
