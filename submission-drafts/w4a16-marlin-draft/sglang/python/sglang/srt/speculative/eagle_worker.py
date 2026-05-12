@@ -755,6 +755,7 @@ class EAGLEWorker(TpModelWorker):
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
             or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.minicpm_hybrid_config is not None
         ):
             self._mamba_verify_update(
                 batch, res, logits_output, spec_info, seq_lens_pre_verify
@@ -843,12 +844,20 @@ class EAGLEWorker(TpModelWorker):
         else:
             mamba_steps_to_track = None
 
-        self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
-            mamba_track_indices=batch.mamba_track_indices,
-            mamba_steps_to_track=mamba_steps_to_track,
-            model=self.target_worker.model_runner.model,
-        )
+        attn_backend = self.target_worker.model_runner.attn_backend
+        if self.target_worker.model_runner.minicpm_hybrid_config is not None:
+            attn_backend.update_simple_gla_state_after_target_verify(
+                accepted_steps=accepted_steps,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            )
+        else:
+            attn_backend.update_mamba_state_after_mtp_verify(
+                accepted_steps=accepted_steps,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                model=self.target_worker.model_runner.model,
+            )
 
     def forward_draft_extend(
         self,

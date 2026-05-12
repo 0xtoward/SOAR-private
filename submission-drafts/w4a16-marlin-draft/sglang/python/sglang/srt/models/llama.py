@@ -763,7 +763,8 @@ class LlamaForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
+        if hasattr(self.model, "load_kv_cache_scales"):
+            self.model.load_kv_cache_scales(quantization_param_path)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:

@@ -14,13 +14,16 @@
 """Inference-only MiniCPM model compatible with HuggingFace weights."""
 
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import SimpleGLAAttnBackend
 from sglang.srt.layers.attention.minicpm_sparse_utils import (
@@ -45,7 +48,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    kv_cache_scales_loader,
+)
 from sglang.srt.utils import add_prefix
 
 
@@ -539,6 +545,7 @@ class MiniCPMModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
 
     def forward(
         self,
@@ -552,8 +559,11 @@ class MiniCPMModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+        aux_hidden_states = []
 
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -562,7 +572,36 @@ class MiniCPMModel(nn.Module):
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        full_attn_layers = {
+            idx
+            for idx, mixer_type in enumerate(self.config.mixer_types)
+            if mixer_type == "minicpm4"
+        }
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            tp_rank,
+            tp_size,
+            self.config.num_hidden_layers,
+            self.config.__class__.model_type,
+        ):
+            if layer_idx not in full_attn_layers:
+                continue
+
+            layer_self_attn = self.layers[layer_idx].self_attn
+            if hasattr(layer_self_attn.attn, "k_scale"):
+                layer_self_attn.attn.k_scale = scaling_factor
+                layer_self_attn.attn.v_scale = scaling_factor
+            else:
+                raise RuntimeError(
+                    "Self attention has no KV cache scaling factor attribute!"
+                )
 
 
 class MiniCPMSALAForCausalLM(nn.Module):
@@ -592,6 +631,7 @@ class MiniCPMSALAForCausalLM(nn.Module):
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
 
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -604,12 +644,45 @@ class MiniCPMSALAForCausalLM(nn.Module):
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
         else:
             lm_head = self.lm_head
-        return self.logits_processor(input_ids, hidden_states, lm_head, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states
+        )
+
+    def get_embed_and_head(self):
+        if self.config.tie_word_embeddings:
+            lm_head = self.model.embed_tokens
+        else:
+            lm_head = self.lm_head
+        return self.model.embed_tokens.weight, lm_head.weight
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        num_layers = self.config.num_hidden_layers
+        if layer_ids is None:
+            candidates = [num_layers // 4, num_layers // 2, (3 * num_layers) // 4]
+            self.model.layers_to_capture = sorted(
+                {min(max(layer_id, 0), num_layers - 1) for layer_id in candidates}
+            )
+        else:
+            # SGLang passes target layer ids; capture the hidden state entering
+            # the following layer, matching the LLaMA EAGLE3 convention.
+            self.model.layers_to_capture = sorted(
+                {
+                    min(max(layer_id + 1, 0), num_layers - 1)
+                    for layer_id in layer_ids
+                }
+            )
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
