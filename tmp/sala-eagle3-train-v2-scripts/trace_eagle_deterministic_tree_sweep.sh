@@ -13,6 +13,8 @@ SESSION_NAME=${SESSION_NAME:-sala_eagle3_det_tree_sweep}
 PROMPTS_JSONL=${PROMPTS_JSONL:-$RUN_DIR/prompts.jsonl}
 REQUEST_BATCH_SIZE=${REQUEST_BATCH_SIZE:-1}
 SPECULATIVE_ATTENTION_MODE=${SPECULATIVE_ATTENTION_MODE:-prefill}
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-triton}
+BASELINE_CASE_NAME=${BASELINE_CASE_NAME:-baseline_${ATTENTION_BACKEND}}
 DETERMINISTIC=${DETERMINISTIC:-1}
 RUN_FORCE_REJECT_CASES=${RUN_FORCE_REJECT_CASES:-1}
 ROOT_ONLY_VERIFY=${ROOT_ONLY_VERIFY:-0}
@@ -45,7 +47,7 @@ BASE_COMMON=(
   --dtype bfloat16
   --mem-fraction-static "$MEM_FRACTION_STATIC"
   --decode-log-interval 1
-  --attention-backend triton
+  --attention-backend "$ATTENTION_BACKEND"
 )
 
 if [[ "$DETERMINISTIC" == 1 ]]; then
@@ -121,6 +123,7 @@ cleanup_server() {
       kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       sleep 2
       kill -9 -- "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
     fi
   fi
 }
@@ -200,6 +203,7 @@ append_manifest() {
   CASE="$1" BASELINE_CASE="$2" CASE_KIND="$3" STEPS_VALUE="$4" TOPK_VALUE="$5" DRAFT_TOKENS_VALUE="$6" \
     FORCE_REJECT_VALUE="$7" TRACE_PATH_VALUE="$8" FORCE_REJECT_CASE_VALUE="$9" PROMPT_IDS_JSON="$PROMPT_IDS_JSON" \
     HEAD_PATH_VALUE="$HEAD" SPEC_MODE_VALUE="$SPECULATIVE_ATTENTION_MODE" DETERMINISTIC_VALUE="$DETERMINISTIC" \
+    ATTENTION_BACKEND_VALUE="$ATTENTION_BACKEND" \
     REQUEST_BATCH_SIZE_VALUE="$REQUEST_BATCH_SIZE" ROOT_ONLY_VERIFY_VALUE="$ROOT_ONLY_VERIFY" \
     python - "$RUN_DIR/case_manifest.jsonl" <<'PY'
 import json
@@ -213,7 +217,7 @@ row = {
     "head_label": "eagle_head",
     "head_path": os.environ["HEAD_PATH_VALUE"],
     "head_vocab_mode": "hot" if "hot32k" in os.environ["HEAD_PATH_VALUE"] else "unknown",
-    "backend": "triton",
+    "backend": os.environ["ATTENTION_BACKEND_VALUE"],
     "spec_attention_mode": os.environ["SPEC_MODE_VALUE"],
     "deterministic": os.environ["DETERMINISTIC_VALUE"] == "1",
     "root_only_verify": os.environ.get("ROOT_ONLY_VERIFY_VALUE") == "1",
@@ -267,6 +271,7 @@ run_case() {
   echo "head=$HEAD"
   echo "prompts=$PROMPTS_JSONL"
   echo "prompt_ids=$PROMPT_IDS_JSON"
+  echo "attention_backend=$ATTENTION_BACKEND"
   echo "deterministic=$DETERMINISTIC"
   echo "speculative_attention_mode=$SPECULATIVE_ATTENTION_MODE"
   echo "request_batch_size=$REQUEST_BATCH_SIZE"
@@ -274,19 +279,19 @@ run_case() {
   echo "config_matrix=$CONFIG_MATRIX"
   : > "$RUN_DIR/case_manifest.jsonl"
 
-  run_case baseline_triton baseline_triton baseline "" "" "" 0 \
+  run_case "$BASELINE_CASE_NAME" "$BASELINE_CASE_NAME" baseline "" "" "" 0 \
     "${BASE_COMMON[@]}"
 
   for spec in $CONFIG_MATRIX; do
     IFS=':' read -r label steps topk draft_tokens <<< "$spec"
     if [[ "$RUN_FORCE_REJECT_CASES" == 1 ]]; then
-      run_case "force_reject_${label}" baseline_triton "force_reject_${label}" "$steps" "$topk" "$draft_tokens" 1 \
+      run_case "force_reject_${label}" "$BASELINE_CASE_NAME" "force_reject_${label}" "$steps" "$topk" "$draft_tokens" 1 \
         "${BASE_COMMON[@]}" "${HEAD_ARGS[@]}" \
         --speculative-num-steps "$steps" \
         --speculative-eagle-topk "$topk" \
         --speculative-num-draft-tokens "$draft_tokens"
     fi
-    run_case "accept_${label}" baseline_triton "accept_${label}" "$steps" "$topk" "$draft_tokens" 0 \
+    run_case "accept_${label}" "$BASELINE_CASE_NAME" "accept_${label}" "$steps" "$topk" "$draft_tokens" 0 \
       "${BASE_COMMON[@]}" "${HEAD_ARGS[@]}" \
       --speculative-num-steps "$steps" \
       --speculative-eagle-topk "$topk" \

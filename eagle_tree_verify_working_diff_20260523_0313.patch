@@ -1,0 +1,25 @@
+diff --git a/tmp/sglang-openbmb-minicpm-sala/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py b/tmp/sglang-openbmb-minicpm-sala/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+index ee0400e..269c788 100644
+--- a/tmp/sglang-openbmb-minicpm-sala/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
++++ b/tmp/sglang-openbmb-minicpm-sala/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py
+@@ -1830,6 +1830,12 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
+             batch_indices = torch.arange(
+                 batch_size, dtype=torch.long, device=q_steps.device
+             )
++            step_cu_seqlens = torch.arange(
++                0,
++                batch_size + 1,
++                dtype=torch.int32,
++                device=q_steps.device,
++            )
+             state = initial_state
+             outputs = []
+             for step in range(seq_len):
+@@ -1873,6 +1879,7 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
+                     scale=scale,
+                     initial_state=step_state,
+                     output_final_state=True,
++                    cu_seqlens=step_cu_seqlens,
+                 )
+                 mamba_caches.intermediate_ssm[cache_idx, :batch_size, step] = state.to(
+                     mamba_caches.intermediate_ssm.dtype, copy=False
