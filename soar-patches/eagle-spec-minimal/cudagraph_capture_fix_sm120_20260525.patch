@@ -1,0 +1,53 @@
+--- /root/autodl-tmp/codex-drafts/spec_engine/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py.bak_capturefix	2026-05-25 17:03:08.532573385 +0800
++++ /root/autodl-tmp/codex-drafts/spec_engine/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py	2026-05-25 19:34:20.363557411 +0800
+@@ -1666,15 +1666,21 @@
+         )
+ 
+         for step in range(seq_len):
++            # capture-safe: fixed-shape gather/scatter_/where (no dynamic boolean-mask indexing)
+             child = retrieve_next_token[:, step]
+             valid_child = (child >= 0) & (child < seq_len)
+-            parent_tokens[batch_indices[valid_child], child[valid_child]] = step
++            safe_child = torch.where(valid_child, child, torch.zeros_like(child))
++            cur_c = parent_tokens.gather(1, safe_child.unsqueeze(1)).squeeze(1)
++            new_c = torch.where(valid_child, torch.full_like(cur_c, step), cur_c)
++            parent_tokens.scatter_(1, safe_child.unsqueeze(1), new_c.unsqueeze(1))
+ 
+             sibling = retrieve_next_sibling[:, step]
+             valid_sibling = (sibling >= 0) & (sibling < seq_len)
+-            parent_tokens[batch_indices[valid_sibling], sibling[valid_sibling]] = (
+-                parent_tokens[batch_indices[valid_sibling], step]
+-            )
++            safe_sib = torch.where(valid_sibling, sibling, torch.zeros_like(sibling))
++            val_at_step = parent_tokens[:, step]
++            cur_s = parent_tokens.gather(1, safe_sib.unsqueeze(1)).squeeze(1)
++            new_s = torch.where(valid_sibling, val_at_step, cur_s)
++            parent_tokens.scatter_(1, safe_sib.unsqueeze(1), new_s.unsqueeze(1))
+ 
+         retrieve_parent_token = getattr(
+             forward_metadata, "retrieve_parent_token", None
+@@ -1766,13 +1772,13 @@
+         all_valid = None
+         sorted_decode_perm = None
+         sorted_decode_inv_perm = None
+-        if forward_batch.forward_mode.is_decode() or has_initial_state.any():
++        if forward_batch.forward_mode.is_decode() or torch.cuda.is_current_stream_capturing() or has_initial_state.any():
+             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+             if cache_idx is not None:
+                 layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+                 pad_idx = layer_cache.temporal.shape[0] - 1
+                 valid_mask = mamba_indices >= 0
+-                all_valid = bool(valid_mask.all().item())
++                all_valid = (False if torch.cuda.is_current_stream_capturing() else bool(valid_mask.all().item()))
+                 if all_valid:
+                     safe_mamba_indices = mamba_indices.to(torch.int64)
+                     if self.sort_decode_by_state and forward_batch.forward_mode.is_decode() and safe_mamba_indices.numel() > 1:
+@@ -1945,7 +1951,7 @@
+                     layer_cache = self.req_to_token_pool.mamba_pool.mamba2_layer_cache(cache_idx)
+                     pad_idx = layer_cache.temporal.shape[0] - 1
+                     valid_mask = mamba_indices >= 0
+-                    all_valid = bool(valid_mask.all().item())
++                    all_valid = (False if torch.cuda.is_current_stream_capturing() else bool(valid_mask.all().item()))
+                     safe_mamba_indices = torch.where(
+                         valid_mask,
+                         mamba_indices,
