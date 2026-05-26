@@ -1,0 +1,73 @@
+--- layers/attention/hybrid_linear_attn_backend.py.bak_matchdecode	2026-05-26 12:46:24.085696004 +0800
++++ layers/attention/hybrid_linear_attn_backend.py	2026-05-26 14:48:07.708883718 +0800
+@@ -1609,6 +1609,7 @@
+         self.fused_recurrent_max_seq_len = 80
+         self.sort_decode_by_state = os.getenv("SGLANG_SIMPLE_GLA_SORT_DECODE_BY_STATE", "0") == "1"
+         self.indexed_fused_decode = os.getenv("SGLANG_SIMPLE_GLA_INDEXED_FUSED_DECODE", "0") == "1"
++        self._verify_match_decode = os.environ.get("SPEC_NGRAM_VERIFY_MATCH_DECODE", "0") == "1"
+ 
+     def _get_mamba_indices(self, forward_batch: ForwardBatch) -> torch.Tensor:
+         """Get mamba cache indices with fallback logic.
+@@ -1897,15 +1898,44 @@
+                         ].to(initial_state.dtype, copy=False)
+                         step_state = step_state.contiguous()
+ 
+-                o_step, state = fused_recurrent_simple_gla(
+-                    q=q_steps[:, step : step + 1],
+-                    k=k_steps[:, step : step + 1],
+-                    v=v_steps[:, step : step + 1],
+-                    g_gamma=g_gamma,
+-                    scale=scale,
+-                    initial_state=step_state,
+-                    output_final_state=True,
+-                )
++                if self._verify_match_decode:
++                    # Match the DECODE call exactly: feed this step as a varlen
++                    # batch of `batch_size` length-1 sequences (B=1, T=batch_size)
++                    # with cu_seqlens, identical layout to the decode branch.
++                    q1 = q_steps[:, step].unsqueeze(0)
++                    k1 = k_steps[:, step].unsqueeze(0)
++                    v1 = v_steps[:, step].unsqueeze(0)
++                    step_cu_seqlens = torch.arange(
++                        batch_size + 1, dtype=torch.int32, device=q.device
++                    )
++                    o_step, state = fused_recurrent_simple_gla(
++                        q=q1,
++                        k=k1,
++                        v=v1,
++                        g_gamma=g_gamma,
++                        scale=scale,
++                        initial_state=step_state,
++                        output_final_state=True,
++                        cu_seqlens=step_cu_seqlens,
++                    )
++                    # Varlen returns o as [1, batch_size, H, V]; reshape back to
++                    # [batch_size, 1, H, V] so cat(dim=1) below is unchanged.
++                    # final_state is [batch_size, H, K, V] already (matches the
++                    # non-varlen path), so `intermediate_ssm[..., step] = state`
++                    # works unchanged.
++                    o_step = o_step.reshape(
++                        batch_size, 1, o_step.shape[2], o_step.shape[3]
++                    )
++                else:
++                    o_step, state = fused_recurrent_simple_gla(
++                        q=q_steps[:, step : step + 1],
++                        k=k_steps[:, step : step + 1],
++                        v=v_steps[:, step : step + 1],
++                        g_gamma=g_gamma,
++                        scale=scale,
++                        initial_state=step_state,
++                        output_final_state=True,
++                    )
+                 mamba_caches.intermediate_ssm[cache_idx, :batch_size, step] = state.to(
+                     mamba_caches.intermediate_ssm.dtype, copy=False
+                 )
+@@ -1961,7 +1991,7 @@
+                     == "1"
+                 )
+                 if not skip_target_verify_temporal_write:
+-                    if valid_mask is None or all_valid:
++                    if valid_mask is None or all_valid or torch.cuda.is_current_stream_capturing():
+                         layer_cache.temporal.index_copy_(0, safe_mamba_indices, final_state)
+                     else:
+                         layer_cache.temporal.index_copy_(

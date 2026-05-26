@@ -1,0 +1,59 @@
+--- speculative/ngram_worker.py.bak_batchgate	2026-05-26 03:13:39.357047133 +0800
++++ speculative/ngram_worker.py	2026-05-26 03:13:39.357047133 +0800
+@@ -60,6 +60,7 @@
+         self._index_prompt = os.environ.get("SPEC_NGRAM_INDEX_PROMPT", "0") == "1"
+         self._prompt_indexed_rids = set()
+         self._fix_gla_state = os.environ.get("SPEC_NGRAM_FIX_GLA", "0") == "1"
++        self._batch_gate = int(os.environ.get("SPEC_NGRAM_BATCH_GATE", "-1"))
+ 
+     def clear_cache_pool(self):
+         self.ngram_cache.reset()
+@@ -200,6 +201,35 @@
+         )
+         batch.spec_info.prepare_for_verify(batch, self.page_size)
+ 
++    def _gated_plain_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
++        # Run a plain (no-spec) decode for this batch. ngram is not spec_v2, so the
++        # scheduler does not append output_ids -> we append + check_finished here
++        # (mirroring _fill_requests for 1 token/req).
++        saved_algo = batch.spec_algorithm
++        batch.spec_info = None
++        batch.spec_algorithm = SpeculativeAlgorithm.NONE  # un-gate ScheduleBatch.prepare_for_decode
++        last_ids = [
++            (req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1])
++            for req in batch.reqs
++        ]
++        batch.output_ids = torch.tensor(last_ids, dtype=torch.int64, device=self.device)
++        batch.prepare_for_decode()
++        model_worker_batch = batch.get_model_worker_batch()
++        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
++        batch.spec_algorithm = saved_algo
++        batch.forward_mode = ForwardMode.DECODE
++        next_token_ids = batch_result.next_token_ids
++        for req, tid in zip(batch.reqs, next_token_ids.tolist()):
++            req.output_ids.append(tid)
++            req.check_finished()
++        return GenerationBatchResult(
++            logits_output=batch_result.logits_output,
++            next_token_ids=next_token_ids,
++            num_accepted_tokens=0,
++            can_run_cuda_graph=batch_result.can_run_cuda_graph,
++            accept_lens=None,
++        )
++
+     def _update_ngram_cache(self, batch: ScheduleBatch, reqs=None, full_prompt=False):
+         batch_tokens = []
+         for req in (reqs if reqs is not None else batch.reqs):
+@@ -218,6 +248,12 @@
+         self.ngram_cache.batch_put(batch_tokens)
+ 
+     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
++        if (
++            self._batch_gate >= 0
++            and not batch.forward_mode.is_extend()
++            and batch.batch_size() > self._batch_gate
++        ):
++            return self._gated_plain_decode(batch)
+         self._prepare_for_speculative_decoding(batch)
+         model_worker_batch = batch.get_model_worker_batch()
+         num_accepted_tokens = 0
